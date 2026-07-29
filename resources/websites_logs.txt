@@ -1,0 +1,1 @@
+CSV run complete. processed=10000, failed=3003, output=C:\Users\Colcom38\Desktop\Crawlers\adgraph\resources\adLikelyUrls.csv

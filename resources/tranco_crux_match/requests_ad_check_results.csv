@@ -1,0 +1,15 @@
+index,inputDomain,finalUrl,statusCode,adLikely,matchedSelectorCount
+1,google.com,https://www.google.com/,200,False,0
+2,microsoft.com,https://www.microsoft.com/,200,True,1
+3,googleapis.com,https://googleapis.com/,404,False,0
+4,facebook.com,https://mbasic.facebook.com/,200,False,0
+5,gtld-servers.net,,,False,0
+6,mail.ru,,,False,0
+7,cloudflare.com,https://www.cloudflare.com/,200,False,0
+8,apple.com,https://www.apple.com/,200,False,0
+9,youtube.com,https://m.youtube.com/supported_browsers?next_url=https%3A%2F%2Fm.youtube.com%2F,200,True,0
+10,amazonaws.com,,,False,0
+11,gstatic.com,https://www.gstatic.com/,404,False,0
+12,instagram.com,https://www.instagram.com/,200,True,0
+13,dzen.ru,,,False,0
+14,akamai.net,,,False,0

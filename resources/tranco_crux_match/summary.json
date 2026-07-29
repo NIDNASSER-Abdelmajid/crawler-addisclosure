@@ -1,0 +1,71 @@
+{
+  "generatedAt": "2026-03-13T13:58:33.716968+00:00",
+  "outputDir": "resources\\tranco_crux_match",
+  "runs": [
+    {
+      "runAt": "2026-03-13T13:41:41.547181+00:00",
+      "trancoUrl": "https://tranco-list.eu/top-1m.csv.zip",
+      "trancoArchive": "resources\\tranco_crux_match\\tranco_top_1m.csv.zip",
+      "cruxSource": "results\\sample_crux_domains.txt",
+      "nTrancoDomains": 1000000,
+      "nCruxRows": 3,
+      "nUniqueCruxDomains": 3,
+      "nMatchedDomains": 3,
+      "matchedDomainsHash": "1d82ddce95e8c6892cb05f683647e4fff0f6d5db8dd528c0ec05bd4994c46c80",
+      "matchedDomainsMtime": "2026-03-13T13:41:41.546840+00:00"
+    },
+    {
+      "runAt": "2026-03-13T13:47:38.296502+00:00",
+      "trancoUrl": "https://tranco-list.eu/top-1m.csv.zip",
+      "trancoArchive": "resources\\tranco_crux_match\\tranco_top_1m.csv.zip",
+      "cruxSource": "results\\sample_crux_domains.txt",
+      "nTrancoDomains": 1000000,
+      "nCruxRows": 3,
+      "nUniqueCruxDomains": 3,
+      "nMatchedDomains": 3,
+      "matchedDomainsHash": "1d82ddce95e8c6892cb05f683647e4fff0f6d5db8dd528c0ec05bd4994c46c80",
+      "matchedDomainsMtime": "2026-03-13T13:47:38.295618+00:00"
+    },
+    {
+      "runAt": "2026-03-13T13:52:50.520637+00:00",
+      "trancoUrl": "https://tranco-list.eu/top-1m.csv.zip",
+      "trancoArchive": "resources\\tranco_crux_match\\tranco_top_1m.csv.zip",
+      "cruxUrl": "https://storage.googleapis.com/chrome-ux-report/records-downloads/crux_top_sites.csv",
+      "cruxSource": "resources\\tranco_crux_match\\sample_crux_domains.txt",
+      "cruxDownloadError": "HTTP Error 403: Forbidden",
+      "cruxUsedFallback": true,
+      "nTrancoDomains": 1000000,
+      "nCruxRows": 3,
+      "nUniqueCruxDomains": 3,
+      "nMatchedDomains": 3,
+      "matchedDomainsHash": "1d82ddce95e8c6892cb05f683647e4fff0f6d5db8dd528c0ec05bd4994c46c80",
+      "matchedDomainsMtime": "2026-03-13T13:52:50.519965+00:00"
+    },
+    {
+      "runAt": "2026-03-13T13:55:23.878474+00:00",
+      "trancoUrl": "https://tranco-list.eu/top-1m.csv.zip",
+      "trancoArchive": "resources\\tranco_crux_match\\tranco_top_1m.csv.zip",
+      "cruxUrl": "https://raw.githubusercontent.com/zakird/crux-top-lists/main/data/global/current.csv.gz",
+      "cruxSource": "resources\\tranco_crux_match\\crux_source_20260313T135516Z.gz",
+      "nTrancoDomains": 1000000,
+      "nCruxRows": 1000000,
+      "nUniqueCruxDomains": 984564,
+      "nMatchedDomains": 396812,
+      "matchedDomainsHash": "5ec479d840f7a3f5987996949eccf65274c70bc71a8a14b2b7d22c52dbb388ae",
+      "matchedDomainsMtime": "2026-03-13T13:55:23.877462+00:00"
+    },
+    {
+      "runAt": "2026-03-13T13:58:33.716968+00:00",
+      "trancoUrl": "https://tranco-list.eu/top-1m.csv.zip",
+      "trancoArchive": "resources\\tranco_crux_match\\tranco_top_1m.csv.zip",
+      "cruxUrl": "https://raw.githubusercontent.com/zakird/crux-top-lists/main/data/global/current.csv.gz",
+      "cruxSource": "resources\\tranco_crux_match\\crux_source_20260313T135826Z.gz",
+      "nTrancoDomains": 1000000,
+      "nCruxRows": 1000000,
+      "nUniqueCruxDomains": 984564,
+      "nMatchedDomains": 385183,
+      "matchedDomainsHash": "0346cbaff7efdbc9f190934fe01d75e9f3a7b46a335449cc2a26055cdbd3da49",
+      "matchedDomainsMtime": "2026-03-13T13:58:33.712920+00:00"
+    }
+  ]
+}

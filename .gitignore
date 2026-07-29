@@ -1,0 +1,60 @@
+# Python cache and env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs and temp runtime files
+*.log
+.pw_data_dir/
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.claude/
+
+# Frontend/runtime artifacts
+node_modules/
+dashboard-vite/.electron-data/
+
+# Databases
+*.sqlite
+*.db
+
+# Data and output directories
+data/
+data_*/
+results/
+results_*/
+kids_results/
+kids_results_*/
+tmp_upstream/
+remove/
+
+# Generated analysis outputs and scratch files
+ad_cluster_units.json
+ad_features_clusters.json
+ad_features_similarity.json
+addisclosures.json
+addisclosures_with_clusters.json
+final_summary.json
+sw.csv
+sw2.csv
+sw3.csv
+sw_failed_urls.txt
+test_out.txt
+test_out_copy.txt
+test_results.txt
+typeerror.txt
+latex.txt
+next.md
+analytics.txt
+steps.md
+commands.txt
+debug.txt
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+*.ipynb

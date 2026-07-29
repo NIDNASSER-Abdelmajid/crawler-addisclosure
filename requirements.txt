@@ -1,0 +1,10 @@
+# AdGraph Crawler dependencies
+playwright>=1.44.0        # async browser automation (Chromium included via `playwright install`)
+flask>=2.0
+requests>=2.0
+tqdm>=4.66.0
+numpy>=1.26
+scikit-learn>=1.4
+torch>=2.3
+transformers>=4.51
+huggingface-hub>=0.23

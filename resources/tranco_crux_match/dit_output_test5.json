@@ -1,0 +1,95 @@
+{
+  "generatedAt": "2026-03-13T15:59:39.753481+00:00",
+  "input": "resources\\tranco_crux_match\\matched_domains.csv",
+  "count": 5,
+  "ditPath": "C:\\Users\\Colcom38\\Desktop\\Crawlers\\adgraph\\preprocessing\\.cache\\dit\\dit_windows_amd64\\dit.exe",
+  "render": false,
+  "timeout": 8,
+  "results": {
+    "google.com": {
+      "domain": "google.com",
+      "url": "https://google.com",
+      "success": true,
+      "returncode": 0,
+      "stdout": "{\n  \"type\": \"landing\",\n  \"forms\": [\n    {\n      \"type\": \"search\",\n      \"fields\": {\n        \"btnG\": \"submit button\",\n        \"btnI\": \"submit button\",\n        \"q\": \"search query\"\n      }\n    }\n  ]\n}",
+      "stderr": "",
+      "timestamp": "2026-03-13T15:59:26.470489+00:00",
+      "parsed_stdout": {
+        "type": "landing",
+        "forms": [
+          {
+            "type": "search",
+            "fields": {
+              "btnG": "submit button",
+              "btnI": "submit button",
+              "q": "search query"
+            }
+          }
+        ]
+      }
+    },
+    "microsoft.com": {
+      "domain": "microsoft.com",
+      "url": "https://microsoft.com",
+      "success": true,
+      "returncode": 0,
+      "stdout": "{\n  \"type\": \"blog\",\n  \"forms\": [\n    {\n      \"type\": \"search\",\n      \"fields\": {\n        \"q\": \"search query\"\n      }\n    }\n  ]\n}",
+      "stderr": "",
+      "timestamp": "2026-03-13T15:59:28.319175+00:00",
+      "parsed_stdout": {
+        "type": "blog",
+        "forms": [
+          {
+            "type": "search",
+            "fields": {
+              "q": "search query"
+            }
+          }
+        ]
+      }
+    },
+    "googleapis.com": {
+      "domain": "googleapis.com",
+      "url": "https://googleapis.com",
+      "success": true,
+      "returncode": 0,
+      "stdout": "{\n  \"type\": \"error\"\n}",
+      "stderr": "",
+      "timestamp": "2026-03-13T15:59:29.842951+00:00",
+      "parsed_stdout": {
+        "type": "error"
+      }
+    },
+    "facebook.com": {
+      "domain": "facebook.com",
+      "url": "https://facebook.com",
+      "success": true,
+      "returncode": 0,
+      "stdout": "{\n  \"type\": \"landing\",\n  \"forms\": [\n    {\n      \"type\": \"login\",\n      \"fields\": {\n        \"email\": \"email\",\n        \"pass\": \"password\"\n      }\n    }\n  ]\n}",
+      "stderr": "",
+      "timestamp": "2026-03-13T15:59:31.736354+00:00",
+      "parsed_stdout": {
+        "type": "landing",
+        "forms": [
+          {
+            "type": "login",
+            "fields": {
+              "email": "email",
+              "pass": "password"
+            }
+          }
+        ]
+      }
+    },
+    "mail.ru": {
+      "domain": "mail.ru",
+      "url": "https://mail.ru",
+      "success": false,
+      "error": "timeout",
+      "timeout": 8,
+      "stdout": "",
+      "stderr": "",
+      "timestamp": "2026-03-13T15:59:39.753357+00:00"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "generatedAt": "2026-03-13T15:14:59.985173+00:00",
+  "totalDomains": 2,
+  "completedDomains": 2,
+  "pendingDomains": 0,
+  "entries": [
+    {
+      "domain": "google.com",
+      "url": "https://google.com",
+      "type": "landing",
+      "formTypes": [
+        "search"
+      ],
+      "verdict": "false_good",
+      "notes": null,
+      "validatedAt": "2026-03-13T15:14:54.700897+00:00"
+    },
+    {
+      "domain": "microsoft.com",
+      "url": "https://microsoft.com",
+      "type": "blog",
+      "formTypes": [
+        "search"
+      ],
+      "verdict": "false_good",
+      "notes": null,
+      "validatedAt": "2026-03-13T15:11:50.461385+00:00"
+    }
+  ]
+}

@@ -1,0 +1,724 @@
+[
+  {
+    "global": "window",
+    "props": [
+      {
+        "name": "devicePixelRatio"
+      },
+      {
+        "name": "localStorage"
+      },
+      {
+        "name": "sessionStorage"
+      },
+      {
+        "name": "indexedDB"
+      },
+      {
+        "name": "name"
+      },
+      {
+        "name": "innerWidth"
+      },
+      {
+        "name": "innerHeight"
+      },
+      {
+        "name": "outerWidth"
+      },
+      {
+        "name": "outerHeight"
+      },
+      {
+        "name": "screenX"
+      },
+      {
+        "name": "screenY"
+      },
+      {
+        "name": "screenLeft"
+      },
+      {
+        "name": "screenTop"
+      }
+    ],
+    "methods": [
+      {
+        "name": "openDatabase",
+        "test": "openDatabase(\"test\", \"1.0\", \"test\", 1024)"
+      },
+      {
+        "name": "matchMedia",
+        "description": "window.matchMedia(\"prefers-color-scheme\")",
+        "condition": "arguments.length > 0 && arguments[0].includes(\"prefers-color-scheme\")",
+        "test": "window.matchMedia(\"(prefers-color-scheme: dark)\")"
+      },
+      {
+        "name": "matchMedia",
+        "description": "window.matchMedia(\"prefers-reduced-motion\")",
+        "condition": "arguments.length > 0 && arguments[0].includes(\"prefers-reduced-motion\")",
+        "test": "window.matchMedia(\"(prefers-reduced-motion: reduce)\")"
+      },
+      {
+        "name": "matchMedia",
+        "description": "window.matchMedia(\"color-gamut\")",
+        "condition": "arguments.length > 0 && arguments[0].includes(\"color-gamut\")",
+        "test": "window.matchMedia(\"(color-gamut: rec2020)\")"
+      },
+      {
+        "name": "matchMedia",
+        "description": "window.matchMedia(\"pointer\")",
+        "condition": "arguments.length > 0 && arguments[0].includes(\"pointer\")",
+        "test": "window.matchMedia(\"(pointer: fine)\")"
+      }
+    ]
+  },
+  {
+    "proto": "BarProp",
+    "props": [
+      {
+        "name": "visible",
+        "test": "window.locationbar.visible"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "global": "console",
+    "props": [
+      {
+        "name": "memory"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "global": "Reflect.getPrototypeOf(document.fonts)",
+    "props": [],
+    "methods": [
+      {
+        "name": "check",
+        "description": "document.fonts.check",
+        "test": "document.fonts.check(\"normal 10px Arial\")"
+      }
+    ]
+  },
+  {
+    "proto": "Performance",
+    "props": [
+      {
+        "name": "memory"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "PerformanceTiming",
+    "props": [
+      {
+        "name": "navigationStart",
+        "test": "performance.timing.navigationStart"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "Document",
+    "props": [
+      {
+        "name": "cookie",
+        "description": "Document.cookie getter"
+      },
+      {
+        "name": "cookie",
+        "description": "Document.cookie setter",
+        "setter": true,
+        "saveArguments": true
+      }
+    ],
+    "methods": [
+      {
+        "name": "interestCohort"
+      }
+    ]
+  },
+  {
+    "proto": "CookieStore",
+    "props": [],
+    "methods": [
+      {
+        "name": "get"
+      },
+      {
+        "name": "getAll"
+      },
+      {
+        "name": "set",
+        "saveArguments": true
+      }
+    ]
+  },
+  {
+    "proto": "Navigator",
+    "props": [
+      {
+        "name": "appName"
+      },
+      {
+        "name": "appCodeName"
+      },
+      {
+        "name": "appVersion"
+      },
+      {
+        "name": "mimeTypes"
+      },
+      {
+        "name": "cookieEnabled"
+      },
+      {
+        "name": "language"
+      },
+      {
+        "name": "languages"
+      },
+      {
+        "name": "userAgent"
+      },
+      {
+        "name": "plugins"
+      },
+      {
+        "name": "platform"
+      },
+      {
+        "name": "doNotTrack"
+      },
+      {
+        "name": "hardwareConcurrency"
+      },
+      {
+        "name": "maxTouchPoints"
+      },
+      {
+        "name": "mediaCapabilities"
+      },
+      {
+        "name": "mediaDevices"
+      },
+      {
+        "name": "mimeTypes"
+      },
+      {
+        "name": "deviceMemory"
+      },
+      {
+        "name": "connection"
+      },
+      {
+        "name": "onLine"
+      },
+      {
+        "name": "keyboard"
+      },
+      {
+        "name": "permissions"
+      },
+      {
+        "name": "presentation"
+      },
+      {
+        "name": "product"
+      },
+      {
+        "name": "productSub"
+      },
+      {
+        "name": "storage"
+      },
+      {
+        "name": "vendor"
+      },
+      {
+        "name": "vendorSub"
+      },
+      {
+        "name": "webdriver"
+      },
+      {
+        "name": "webkitPersistentStorage"
+      },
+      {
+        "name": "webkitTemporaryStorage"
+      }
+    ],
+    "methods": [
+      {
+        "name": "getBattery"
+      },
+      {
+        "name": "getGamepads"
+      },
+      {
+        "name": "javaEnabled"
+      },
+      {
+        "name": "requestMediaKeySystemAccess"
+      }
+    ]
+  },
+  {
+    "proto": "NavigatorUAData",
+    "props": [
+      {
+        "name": "brands"
+      },
+      {
+        "name": "platform"
+      }
+    ],
+    "methods": [
+      {
+        "name": "getHighEntropyValues"
+      }
+    ]
+  },
+  {
+    "proto": "MediaDevices",
+    "props": [],
+    "methods": [
+      {
+        "name": "enumerateDevices"
+      }
+    ]
+  },
+  {
+    "proto": "Screen",
+    "props": [
+      {
+        "name": "width"
+      },
+      {
+        "name": "height"
+      },
+      {
+        "name": "availWidth"
+      },
+      {
+        "name": "availHeight"
+      },
+      {
+        "name": "colorDepth"
+      },
+      {
+        "name": "pixelDepth"
+      },
+      {
+        "name": "availLeft"
+      },
+      {
+        "name": "availTop"
+      },
+      {
+        "name": "orientation"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "HTMLCanvasElement",
+    "props": [],
+    "methods": [
+      {
+        "name": "constructor",
+        "test": "document.createElement(\"canvas\")"
+      },
+      {
+        "name": "toDataURL",
+        "test": "var c = document.createElement(\"canvas\"); c.toDataURL()"
+      },
+      {
+        "name": "toBlob",
+        "test": "var c = document.createElement(\"canvas\"); c.toBlob()"
+      }
+    ]
+  },
+  {
+    "proto": "CanvasRenderingContext2D",
+    "props": [],
+    "methods": [
+      {
+        "name": "measureText",
+        "test": "var c = document.createElement(\"canvas\"); var ctx = c.getContext(\"2d\"); ctx.measureText(\"txt\");"
+      },
+      {
+        "name": "getImageData",
+        "test": "var c = document.createElement(\"canvas\"); var ctx = c.getContext(\"2d\"); ctx.getImageData();"
+      },
+      {
+        "name": "isPointInPath",
+        "test": "var c = document.createElement(\"canvas\"); var ctx = c.getContext(\"2d\"); ctx.rect(10, 10, 100, 100); ctx.fill(); ctx.isPointInPath(30, 70);"
+      }
+    ]
+  },
+  {
+    "proto": "HTMLMediaElement",
+    "props": [],
+    "methods": [
+      {
+        "name": "canPlayType",
+        "test": "var v = document.createElement(\"video\"); v.canPlayType(\"nope\");"
+      }
+    ]
+  },
+  {
+    "proto": "Date",
+    "props": [],
+    "methods": [
+      {
+        "name": "getTime"
+      },
+      {
+        "name": "getTimezoneOffset"
+      }
+    ]
+  },
+  {
+    "proto": "WebGLRenderingContext",
+    "props": [],
+    "methods": [
+      {
+        "name": "getSupportedExtensions",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl\").getSupportedExtensions()"
+      },
+      {
+        "name": "getExtension",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl\").getExtension(\"\")"
+      },
+      {
+        "name": "getParameter",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl\").getParameter(\"\")"
+      },
+      {
+        "name": "getShaderPrecisionFormat",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl\").getShaderPrecisionFormat(WebGLRenderingContext.FRAGMENT_SHADER, WebGLRenderingContext.LOW_FLOAT)"
+      },
+      {
+        "name": "getContextAttributes",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl\").getContextAttributes()"
+      },
+      {
+        "name": "readPixels",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl\").readPixels(0, 0, 1, 1, WebGLRenderingContext.RGBA, WebGLRenderingContext.UNSIGNED_BYTE, new Uint8Array(4))"
+      }
+    ]
+  },
+  {
+    "proto": "WebGL2RenderingContext",
+    "props": [],
+    "methods": [
+      {
+        "name": "getSupportedExtensions",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl2\").getSupportedExtensions()"
+      },
+      {
+        "name": "getExtension",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl2\").getExtension(\"\")"
+      },
+      {
+        "name": "getParameter",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl2\").getParameter(\"\")"
+      },
+      {
+        "name": "getShaderPrecisionFormat",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl2\").getShaderPrecisionFormat(WebGLRenderingContext.FRAGMENT_SHADER, WebGLRenderingContext.LOW_FLOAT)"
+      },
+      {
+        "name": "getContextAttributes",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl2\").getContextAttributes()"
+      },
+      {
+        "name": "readPixels",
+        "test": "var c = document.createElement(\"canvas\"); c.getContext(\"webgl2\").readPixels(0, 0, 1, 1, WebGLRenderingContext.RGBA, WebGLRenderingContext.UNSIGNED_BYTE, new Uint8Array(4))"
+      }
+    ]
+  },
+  {
+    "proto": "OfflineAudioContext",
+    "props": [],
+    "methods": [
+      {
+        "name": "constructor",
+        "test": "new OfflineAudioContext(2, 512, 96000)"
+      }
+    ]
+  },
+  {
+    "proto": "AudioBuffer",
+    "props": [],
+    "methods": [
+      {
+        "name": "getChannelData",
+        "test": "var a = new AudioBuffer({length: 512, sampleRate: 8000}); a.getChannelData(0)"
+      }
+    ]
+  },
+  {
+    "proto": "AudioWorkletNode",
+    "props": [],
+    "methods": [
+      {
+        "name": "constructor"
+      }
+    ]
+  },
+  {
+    "proto": "RTCPeerConnection",
+    "props": [],
+    "methods": [
+      {
+        "name": "constructor"
+      }
+    ]
+  },
+  {
+    "proto": "RTCPeerConnectionIceEvent",
+    "props": [
+      {
+        "name": "candidate",
+        "test": "var c = new RTCPeerConnection({iceServers: [{urls: \"stun:stun.l.google.com:19302?transport=udp\"}]}, {optional: [{RtpDataChannels: !0}]}); c.onicecandidate = e => console.log(e.candidate); c.createDataChannel(\"\"); c.createOffer(a => {c.setLocalDescription(a, () => {}, () => {})}, () => {});"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "SharedWorker",
+    "props": [],
+    "methods": [
+      {
+        "name": "constructor",
+        "test": "new SharedWorker(\"script.js\")"
+      }
+    ]
+  },
+  {
+    "proto": "BroadcastChannel",
+    "props": [],
+    "methods": [
+      {
+        "name": "constructor",
+        "test": "new BroadcastChannel(\"test\")"
+      }
+    ]
+  },
+  {
+    "proto": "Intl.DateTimeFormat",
+    "props": [],
+    "methods": [
+      {
+        "name": "resolvedOptions"
+      }
+    ]
+  },
+  {
+    "proto": "TouchEvent",
+    "props": [],
+    "methods": [
+      {
+        "name": "constructor",
+        "test": "document.createEvent(\"TouchEvent\")"
+      }
+    ]
+  },
+  {
+    "proto": "Event",
+    "props": [
+      {
+        "name": "timeStamp"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "KeyboardEvent",
+    "props": [
+      {
+        "name": "code"
+      },
+      {
+        "name": "keyCode"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "global": "MediaSource",
+    "props": [],
+    "methods": [
+      {
+        "name": "isTypeSupported",
+        "test": "MediaSource.isTypeSupported(\"test\")"
+      }
+    ]
+  },
+  {
+    "global": "speechSynthesis.__proto__",
+    "props": [],
+    "methods": [
+      {
+        "name": "getVoices",
+        "test": "speechSynthesis.getVoices()"
+      }
+    ]
+  },
+  {
+    "proto": "Touch",
+    "props": [
+      {
+        "name": "force"
+      },
+      {
+        "name": "radiusX"
+      },
+      {
+        "name": "radiusY"
+      },
+      {
+        "name": "rotationAngle"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "global": "URL",
+    "props": [],
+    "methods": [
+      {
+        "name": "createObjectURL",
+        "test": "URL.createObjectURL(new Blob())"
+      }
+    ]
+  },
+  {
+    "proto": "CSSStyleDeclaration",
+    "props": [],
+    "methods": [
+      {
+        "name": "setProperty",
+        "condition": "arguments.length > 0 && arguments[0].toLowerCase() === \"fontfamily\"",
+        "description": "CSSStyleDeclaration.setProperty(\"fontFamily\",…)",
+        "test": "document.body.style.setProperty(\"fontFamily\", \"Arial\")"
+      }
+    ]
+  },
+  {
+    "proto": "Element",
+    "props": [],
+    "methods": [
+      {
+        "name": "getClientRects",
+        "test": "document.body.getClientRects()"
+      }
+    ]
+  },
+  {
+    "proto": "WheelEvent",
+    "props": [
+      {
+        "name": "deltaX"
+      },
+      {
+        "name": "deltaY"
+      },
+      {
+        "name": "deltaZ"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "Sensor",
+    "props": [],
+    "methods": [
+      {
+        "name": "constructor"
+      },
+      {
+        "name": "start"
+      }
+    ]
+  },
+  {
+    "proto": "DeviceOrientationEvent",
+    "props": [
+      {
+        "name": "alpha"
+      },
+      {
+        "name": "beta"
+      },
+      {
+        "name": "gamma"
+      },
+      {
+        "name": "absolute"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "DeviceMotionEvent",
+    "props": [
+      {
+        "name": "acceleration"
+      },
+      {
+        "name": "accelerationIncludingGravity"
+      },
+      {
+        "name": "rotationRate"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "Animation",
+    "props": [
+      {
+        "name": "currentTime"
+      },
+      {
+        "name": "startTime"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "global": "Notification",
+    "props": [
+      {
+        "name": "permission"
+      }
+    ],
+    "methods": []
+  },
+  {
+    "proto": "Gyroscope",
+    "props": [
+      {
+        "name": "x"
+      },
+      {
+        "name": "y"
+      },
+      {
+        "name": "z"
+      }
+    ],
+    "methods": [
+      {
+        "name": "constructor"
+      }
+    ]
+  }
+]

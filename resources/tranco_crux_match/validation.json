@@ -1,0 +1,45 @@
+{
+  "byDomain": {
+    "google.com": {
+      "verdict": "true_bad",
+      "notes": null,
+      "timestamp": "2026-03-13T15:29:15.409588+00:00"
+    },
+    "microsoft.com": {
+      "verdict": "false_good",
+      "notes": null,
+      "timestamp": "2026-03-13T15:11:50.461385+00:00"
+    },
+    "apple.com": {
+      "verdict": "true_bad",
+      "notes": null,
+      "timestamp": "2026-03-13T15:28:58.995230+00:00"
+    },
+    "cloudflare.com": {
+      "verdict": "true_bad",
+      "notes": null,
+      "timestamp": "2026-03-13T15:29:04.212926+00:00"
+    },
+    "facebook.com": {
+      "verdict": "true_bad",
+      "notes": null,
+      "timestamp": "2026-03-13T15:29:09.319211+00:00"
+    },
+    "googleapis.com": {
+      "verdict": "true_bad",
+      "notes": null,
+      "timestamp": "2026-03-13T15:29:29.059487+00:00"
+    },
+    "gstatic.com": {
+      "verdict": "true_bad",
+      "notes": null,
+      "timestamp": "2026-03-13T15:29:31.531674+00:00"
+    },
+    "instagram.com": {
+      "verdict": "true_bad",
+      "notes": null,
+      "timestamp": "2026-03-13T15:29:37.796378+00:00"
+    }
+  },
+  "updatedAt": "2026-03-13T15:29:37.796393+00:00"
+}
