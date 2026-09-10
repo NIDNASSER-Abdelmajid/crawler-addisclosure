@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from urllib.parse import urlparse
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from Helpers.crawl_context import CrawlContext
 
 from Collectors.APICalls import TrackerTracker
 
@@ -18,11 +23,13 @@ class APICallCollector:
         logger,
         url_hash: str,
         enable_async_stacktraces: bool = False,
+        crawl_context: CrawlContext | None = None,
     ) -> None:
         self._output_dir = output_dir
         self._logger = logger
         self._url_hash = url_hash
         self._enable_async_stacktraces = bool(enable_async_stacktraces)
+        self._crawl_context = crawl_context
 
         self._stats: dict[str, dict[str, int]] = {}
         self._calls: list[dict] = []
@@ -36,6 +43,20 @@ class APICallCollector:
         self._tasks: set[asyncio.Task] = set()
         self._context_setup_lock = asyncio.Lock()
         self._tracked_context_ids: set[int] = set()
+
+    def get_partial_results(self) -> dict:
+        """Synchronously return captured API calls."""
+        call_stats = {
+            source: stats
+            for source, stats in self._stats.items()
+            if self._is_acceptable_url(source)
+        }
+        saved_calls = [call for call in self._calls if self._is_acceptable_url(call.get("source", ""))]
+        return {
+            "callStats": call_stats,
+            "savedCalls": saved_calls,
+            "hasIncompleteData": self._incomplete_data,
+        }
 
     def _is_ignored_error(self, exc: Exception) -> bool:
         text = str(exc)
@@ -106,13 +127,25 @@ class APICallCollector:
 
         self._update_call_stats(source, description)
         if breakpoint.get("saveArguments"):
-            self._calls.append(
-                {
-                    "source": source,
-                    "description": description,
-                    "arguments": breakpoint.get("arguments") or [],
-                }
-            )
+            event_seq = self._crawl_context.event_counter.next() if self._crawl_context else None
+            document_id = self._crawl_context.document_id if self._crawl_context else None
+            ts_ms = int(time.time() * 1000)
+            exec_ctx_id = params.get("executionContextId")
+
+            entry = {
+                "source": source,
+                "description": description,
+                "arguments": breakpoint.get("arguments") or [],
+                "timestamp_ms": ts_ms,
+            }
+            if event_seq is not None:
+                entry["event_seq"] = event_seq
+            if document_id is not None:
+                entry["document_id"] = document_id
+            if exec_ctx_id is not None:
+                entry["execution_context_id"] = exec_ctx_id
+
+            self._calls.append(entry)
 
     def _on_debugger_paused(self, params: dict) -> None:
         if self._closed or not self._tracker:
@@ -134,12 +167,21 @@ class APICallCollector:
         if breakpoint.get("saveArguments"):
             call = self._tracker.retrieve_call_arguments(breakpoint.get("id"))
             if call:
-                self._calls.append(
-                    {
-                        **call,
-                        "source": source,
-                    }
-                )
+                event_seq = self._crawl_context.event_counter.next() if self._crawl_context else None
+                document_id = self._crawl_context.document_id if self._crawl_context else None
+                ts_ms = int(time.time() * 1000)
+
+                call_entry = {
+                    **call,
+                    "source": source,
+                    "timestamp_ms": ts_ms,
+                }
+                if event_seq is not None:
+                    call_entry["event_seq"] = event_seq
+                if document_id is not None:
+                    call_entry["document_id"] = document_id
+
+                self._calls.append(call_entry)
             else:
                 self._logger.debug(
                     f"[{self.COLLECTOR_NAME}] Missing call args for {breakpoint.get('id')}"

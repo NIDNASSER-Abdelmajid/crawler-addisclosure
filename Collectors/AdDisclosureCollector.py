@@ -107,16 +107,18 @@ class AdDisclosureCollector:
         disclosure_page = None
         try:
             disclosure_page = await main_page.context.new_page()
-            await disclosure_page.goto(href, wait_until="domcontentloaded")
+            await disclosure_page.goto(href, wait_until="domcontentloaded", timeout=5000)
             if "adssettings.google.com" in href:
                 for xpath in self.GOOGLE_BUTTONS_XPATH:
                     try:
-                        button = await disclosure_page.wait_for_selector(xpath, timeout=5000)
-                        if button:
-                            await button.click()
-                            await asyncio.sleep(1)
+                        if disclosure_page.is_closed():
+                            break
+                        locator = disclosure_page.locator(xpath).first
+                        if await locator.is_visible(timeout=3000):
+                            await locator.click(timeout=3000)
+                            await asyncio.sleep(0.3)
                     except Exception as exc:
-                        self._logger.debug(f"[{self.COLLECTOR_NAME}] Failed to click Google disclosure button: {exc}")
+                        self._logger.debug(f"[{self.COLLECTOR_NAME}] Google disclosure button skipped/not present: {exc}")
             return await self.capture_disclosure_page(disclosure_page, ad_screenshot_name, expected_href=href)
         except Exception as exc:
             self._logger.debug(f"[{self.COLLECTOR_NAME}] Failed to open disclosure in a new tab: {exc}")

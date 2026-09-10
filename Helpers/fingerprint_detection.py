@@ -70,6 +70,12 @@ def fingerprint_detection_script(binding_name: str = "calledAPIEvent") -> str:
   function emitCall(callDetails) {
     try {
       if (typeof window.__API_CALL_BINDING__ === 'function') {
+        callDetails.timestamp_ms = Date.now();
+        try {
+          callDetails.frameUrl = window.location ? window.location.href : null;
+        } catch (_) {
+          callDetails.frameUrl = null;
+        }
         const maybePromise = window.__API_CALL_BINDING__(callDetails);
         if (maybePromise && typeof maybePromise.catch === 'function') {
           maybePromise.catch(() => undefined);

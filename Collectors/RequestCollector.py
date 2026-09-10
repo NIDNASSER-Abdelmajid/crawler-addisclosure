@@ -28,7 +28,11 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from Helpers.crawl_context import CrawlContext
 
 
 # Response headers kept in the output (everything else is stripped)
@@ -107,10 +111,11 @@ class RequestCollector:
             [h.lower() for h in save_headers] if save_headers else list(DEFAULT_SAVE_HEADERS)
         )
 
-    def init(self, output_dir: str, logger, url_hash: str) -> None:
+    def init(self, output_dir: str, logger, url_hash: str, crawl_context: CrawlContext | None = None) -> None:
         self._output_dir = Path(output_dir)
         self._logger = logger
         self._url_hash = url_hash
+        self._crawl_context = crawl_context
 
         # Keyed by requestId
         self._requests: dict[str, dict] = {}
@@ -152,12 +157,6 @@ class RequestCollector:
 
         Must be called after ``pre_crawl()`` has already been called.
         """
-        # Give the page extra time for late XHR / fetch calls
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:
-            pass  # timeout is fine – we keep whatever we captured
-
         await self._populate_missing_response_hashes()
 
         await self._cdp.detach()
@@ -193,13 +192,18 @@ class RequestCollector:
                     initiator = req.get("initiator")
                     break
 
+        event_seq = self._crawl_context.event_counter.next() if self._crawl_context else None
+        document_id = self._crawl_context.document_id if self._crawl_context else None
+
         entry: dict = {
-            "id":        rid,
-            "url":       url,
-            "method":    method,
-            "type":      rtype,
-            "initiator": initiator,
-            "startTime": start_time,
+            "id":          rid,
+            "url":         url,
+            "method":      method,
+            "type":        rtype,
+            "initiator":   initiator,
+            "startTime":   start_time,
+            "event_seq":   event_seq,
+            "document_id": document_id,
         }
 
         # Handle redirect chain: Chrome re-uses the requestId; the previous
@@ -369,7 +373,7 @@ class RequestCollector:
             headers = entry.get("responseHeaders")
             size = entry.get("size")
 
-            out.append({
+            item = {
                 "url":              url,
                 "method":           entry.get("method"),
                 "type":             entry.get("type"),
@@ -383,6 +387,16 @@ class RequestCollector:
                 "redirectedTo":     entry.get("redirectedTo") or "",
                 "initiators":       _get_initiators(entry.get("initiator")),
                 "time":             round(end - start, 6) if isinstance(start, (int, float)) and isinstance(end, (int, float)) else None,
-            })
+            }
+            if entry.get("event_seq") is not None:
+                item["event_seq"] = entry["event_seq"]
+            if entry.get("document_id") is not None:
+                item["document_id"] = entry["document_id"]
+            out.append(item)
 
         return out
+
+    def get_partial_results(self, final_url: str = "") -> list[dict]:
+        """Synchronously convert all captured requests to results without waiting for body hashes."""
+        return self._build_results(final_url)
+

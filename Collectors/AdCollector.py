@@ -9,21 +9,23 @@ from playwright.async_api import ElementHandle, Frame, Page, TimeoutError as Pla
 from Collectors.AdDisclosureCollector import AdDisclosureCollector
 from Helpers import utils as pageUtils
 from Helpers.ad_choices_matcher import find_ad_choices_in_screenshot
+from Helpers.ad_disclosure import AD_DISC_LINKS_TO_COLLECT, AD_DISCLOSURE_LINKS
 
 
 class AdCollector:
     COLLECTOR_NAME = "AdCollector"
-    MAX_ADS_PER_PAGE = None
+    MAX_ADS_PER_PAGE = 20
     MAX_IFRAMES_PER_CONTEXT = 8
     MAX_FRAME_DEPTH = 4
     MIN_PX_FOR_SCREENSHOT = 30
     SCROLL_TIMEOUT_MS = 20_000
-    ELEMENT_ACTION_TIMEOUT_MS = 5_000
-    EXTRACTION_TIMEOUT_MS = 8_000
-    AD_SCRAPE_TIMEOUT_MS = 20_000
+    ELEMENT_ACTION_TIMEOUT_MS = 1_000
+    EXTRACTION_TIMEOUT_MS = 1_500
+    AD_SCRAPE_TIMEOUT_MS = 10_000
     CONTEXT_SCREENSHOT_MARGIN_PX = 150
     AD_SCREENSHOT_MARGIN_PX = 10
-    ADCHOICES_SELECTOR = ':is(a[href*="whythisad"], a[href*="adchoice"], a[href*="adssettings.google.com"], a#abgl, #abgl)'
+    _disclosure_host_selectors = [f'a[href*="{h}"]' for h in AD_DISCLOSURE_LINKS] + ['a[href*="whythisad"]', 'a[href*="adchoice"]', 'a#abgl', '#abgl']
+    ADCHOICES_SELECTOR = f":is({', '.join(_disclosure_host_selectors)})"
     _ADCHOICES_ICON_HINTS = [
         "adchoice",
         "adchoices",
@@ -45,24 +47,12 @@ class AdCollector:
         r"(?:href|src|data-href|data-url|data-destination-url|data-click-url)\s*=\s*[\"']([^\"']+)[\"']",
         re.IGNORECASE,
     )
-    _ADCHOICE_URL_HINTS = (
-        "whythisad",
-        "adchoice",
-        "adchoices",
-        # "privacy/adinfo",
-        "adssettings.google.com",
-        "privacy.us.criteo.com",
-        "privacy.eu.criteo.com",
-        # "criteo",
-        # "taboola",
-        # "outbrain",
-    )
-    _ADCHOICE_TEXT_HINTS = (
-        "why this ad",
-        "see more ads by this advertiser",
-        "report this ad",
-        "adchoices",
-    ) # https://legal.yahoo.com/us/en/yahoo/privacy/adinfo/index.html
+    _ADCHOICE_URL_HINTS = tuple(set(
+        ["whythisad", "adchoice", "adchoices"] + [h.lower() for h in AD_DISCLOSURE_LINKS]
+    ))
+    _ADCHOICE_TEXT_HINTS = tuple(set(
+        ["why this ad", "adchoice", "adchoices"] + [t.lower() for t in AD_DISC_LINKS_TO_COLLECT]
+    ))
 
     _DEEP_ASSET_JS = """
     (rootNode, adChoiceSelector) => {
@@ -268,126 +258,6 @@ class AdCollector:
     }
     """
 
-    # Extra selectors not in the EasyList file.
-    # Covers Google AdSense, Microsoft/MSN Prism, Outbrain,
-    # DFP/GPT containers, generic ad-framework patterns, and ad iframes.
-    EXTRA_SELECTORS = [
-        # ── Google AdSense / generic ──────────────────────────────────────────
-        "ins.adsbygoogle",
-        '[data-google-query-id]',
-        '[data-ad-client]',
-        '[data-ad-slot]',
-        '[data-ad-unit]',
-        '[data-ad-id]',
-        '[data-ad]',
-        'iframe[id^="google_ads_iframe"]',
-        # ── MSN / Microsoft Prism ad architecture ─────────────────────────────
-        '[class*="prism-ad"]',
-        '[class*="grid-ad"]',
-        '[class*="ad-spot"]',
-        '[class*="ad-slot"]',
-        '[class*="adslot"]',
-        '[class*="ad-unit"]',
-        '[class*="adunit"]',
-        '[class*="ad-zone"]',
-        '[class*="adzone"]',
-        '[class*="ad-container"]',
-        '[class*="ad-wrapper"]',
-        '[class*="ad-placement"]',
-        '[class*="ad-placeholder"]',
-        '[class*="ad-layout"]',
-        '[class*="ad-area"]',
-        '[class*="ad-block"]',
-        '[class*="advertisement"]',
-        '[id*="ad-slot"]',
-        '[id*="adslot"]',
-        '[id*="ad_slot"]',
-        '[id*="ad-unit"]',
-        '[data-ad-zone]',
-        '[data-is-ad]',
-        '[data-advertiserwho]',
-        '[data-ad-type]',
-        # ── MSN shadow-DOM ad elements (discovered via live inspection) ────────
-        '.displayAdContainer',
-        '.displayAdWCContainer',
-        '.display-ads-container',
-        '.ad-banner-wrapper',
-        '.displayAdCard',
-        '.adSlug',
-        '.adChoices',
-        '.adChoicesOutside',
-        '[id^="banner"][class*="displayAd"]',
-        '[id^="rectangle"][class*="displayAd"]',
-        # ── Sponsored / paid content ──────────────────────────────────────────
-        '.sponsored',
-        '[class*="sponsored-content"]',
-        '[class*="paid-content"]',
-        '[class*="promoted"]',
-        '[data-sponsored]',
-        # ── Taboola ───────────────────────────────────────────────────────────
-        '[id^="taboola"]',
-        '[class^="trc_"]',
-        '[id^="trc_"]',
-        '.trc-content-sponsored',
-        '[data-taboola-item-id]',
-        # ── Outbrain ──────────────────────────────────────────────────────────
-        '.ob-widget',
-        '.OUTBRAIN',
-        '[data-widget-id]',
-        '[id^="rc_widget"]',
-        # ── Ad-serving iframes ────────────────────────────────────────────────
-        'iframe[src*="doubleclick.net"]',
-        'iframe[src*="googlesyndication.com"]',
-        'iframe[src*="bing.com"]',
-        'iframe[src*="microsoft.com/ads"]',
-        'iframe[src*="ads.msn.com"]',
-        'iframe[src*="pubcenter.microsoft.com"]',
-        'iframe[src*="moatads.com"]',
-        'iframe[src*="adnxs.com"]',
-        'iframe[src*="pubmatic.com"]',
-        'iframe[src*="openx.net"]',
-        # ── DFP / GPT ad-tag containers ───────────────────────────────────────
-        '[class*="dfp-"]',
-        '[id*="dfp-"]',
-        '[class*="gpt-"]',
-        '[id*="gpt-"]',
-        '.ad-tag',
-        '.ad-label',
-        # ── NYTimes ad containers ─────────────────────────────────────────────
-        '.place-ad',
-        '.placed-ad',
-        '[class*="place-ad"]',
-        '[class*="placed-ad"]',
-        # Hashed CSS wrapper around every NYT ad slot (wraps the dfp- divs)
-        '[class*="dfp-ad-"]',
-        '[id*="dfp-ad-"]',
-        '.ad-container',
-        '.ad-wrapper',
-        '.ad-placement',
-        '.ad-placeholder',
-        '.sponsored-link',
-        '.sponsored-post',
-        '.sponsored-label',
-        '.advertisement-label',
-        '[id*="google_ads_iframe"]',
-        '[id*="re-ad-"]',
-        '[class*="re-ad-"]',
-    ]
-
-    # JavaScript run inside the browser to find ad elements and return their geometry/metadata.
-    #
-    # MSN (and many modern news sites) render their content entirely inside Web
-    # Component shadow roots.  Standard document.querySelectorAll('*') therefore
-    # returns only the thin outer skeleton (~100 elements) while the actual page
-    # content — including ad containers — lives inside shadow DOM subtrees.
-    #
-    # This implementation uses a two-phase strategy:
-    #   Phase 1 – Harvest: recursively walk every shadow root and collect ALL
-    #             elements into a flat list.
-    #   Phase 2 – Detect:  run all detection strategies (CSS selector matching
-    #             via :is() batching, attribute heuristics, aria-label, class/id
-    #             name regex, iframe-domain hints, text-label sniffing) over that
-    #             flat list so shadow DOM elements are never missed.
     _FIND_ADS_JS = """
     (selectors) => {
         // ── Phase 1: Flatten the full DOM tree (including shadow roots) ───────
@@ -414,36 +284,32 @@ class AdCollector:
             if (!adMap.has(el)) adMap.set(el, rule);
         }
 
-        // Find the first CSS selector (from the full list) that matches el.
-        // Uses batched :is() to avoid thousands of individual calls, then
-        // identifies the exact matching selector within the winning chunk.
-        function findMatchingSelector(el, sels) {
-            for (let i = 0; i < sels.length; i += CHUNK) {
-                const chunk = sels.slice(i, i + CHUNK);
-                let batchHit = false;
+        // ── Phase 2a: Fast CSS selector scan via native querySelectorAll ─────
+        const queryRoots = [document, ...allRoots];
+        for (let i = 0; i < selectors.length; i += CHUNK) {
+            const chunk = selectors.slice(i, i + CHUNK);
+            const isSelector = ':is(' + chunk.join(',') + ')';
+            for (const root of queryRoots) {
                 try {
-                    batchHit = el.matches(':is(' + chunk.join(',') + ')');
+                    const matches = root.querySelectorAll(isSelector);
+                    for (const el of matches) {
+                        if (!adMap.has(el)) {
+                            let matchedRule = chunk[0];
+                            for (const s of chunk) {
+                                try { if (el.matches(s)) { matchedRule = s; break; } } catch (_) {}
+                            }
+                            addAd(el, 'selector:' + matchedRule);
+                        }
+                    }
                 } catch (_) {
-                    // Batch :is() failed (invalid selector in chunk) — try individually
                     for (const s of chunk) {
-                        try { if (el.matches(s)) return s; } catch (_2) {}
+                        try {
+                            const matches = root.querySelectorAll(s);
+                            for (const el of matches) addAd(el, 'selector:' + s);
+                        } catch (_2) {}
                     }
-                    continue;
-                }
-                if (batchHit) {
-                    for (const s of chunk) {
-                        try { if (el.matches(s)) return s; } catch (_2) {}
-                    }
-                    return chunk[0]; // fallback (shouldn't happen)
                 }
             }
-            return null;
-        }
-
-        // ── Phase 2a: CSS selector scan over ALL elements ─────────────────────
-        for (const el of allEls) {
-            const rule = findMatchingSelector(el, selectors);
-            if (rule) addAd(el, 'selector:' + rule);
         }
 
         // ── Phase 2b: Explicit ad data-attribute detection ────────────────────
@@ -684,10 +550,6 @@ class AdCollector:
     }
     """
 
-    # Slow multi-pass scroll to trigger lazy-loading on JS-heavy pages.
-    # Pass 1 — slow downward sweep (500 ms / step, 400 px) to wake lazy-loaders.
-    # Pass 2 — faster re-sweep to catch late arrivals.
-    # A 2.5 s pause at the bottom lets ads finish rendering before pass 2.
     _SCROLL_JS = """
     async () => {
         const step = 400;
@@ -742,14 +604,51 @@ class AdCollector:
         (self._output_dir / "ad_videos").mkdir(parents=True, exist_ok=True)
         (self._output_dir / "ad_disclosures").mkdir(parents=True, exist_ok=True)
         from Helpers.easylist_selectors import load_selectors
-        self._selectors = load_selectors() + self.EXTRA_SELECTORS
+        self._selectors = load_selectors()
         self._visited_ad_urls: list[str] = []
         self._ad_disclosure_collector = AdDisclosureCollector()
         self._ad_disclosure_collector.init(str(self._output_dir), self._logger, self._url_hash)
         self._ad_disclosures_contents: list[dict] = []
         self._unmatched_ad_disclosure_contents: list[dict] = []
         self._n_clicked_adchoices_links = 0
-        self._max_ads_captured = max_ads_captured if isinstance(max_ads_captured, int) and max_ads_captured > 0 else None
+        self._ad_attrs: list[dict] = []
+        if isinstance(max_ads_captured, int) and max_ads_captured > 0:
+            self._max_ads_captured = max_ads_captured
+        elif isinstance(self.MAX_ADS_PER_PAGE, int) and self.MAX_ADS_PER_PAGE > 0:
+            self._max_ads_captured = self.MAX_ADS_PER_PAGE
+        else:
+            self._max_ads_captured = None
+
+        self._detected_ads: list[dict] = []
+
+        self._scrape_results: dict[str, int] = {}
+        self._n_small_ads = 0
+        self._n_empty_ads = 0
+        self._n_removed_ads = 0
+        self._n_skipped_ads = 0
+        self._n_timed_out_ads = 0
+        self._n_ad_disclosure_matched = 0
+        self._n_ad_disclosure_unmatched = 0
+
+    def get_partial_results(self) -> dict:
+        """Return partial ad collection results captured before a timeout or interruption."""
+        return {
+            "scrapeResults": {
+                "nDetectedAds": len(self._detected_ads),
+                "nAdsScraped": len(self._ad_attrs),
+                "nSmallAds": self._n_small_ads,
+                "nEmptyAds": self._n_empty_ads,
+                "nRemovedAds": self._n_removed_ads,
+                "nSkippedAds": self._n_skipped_ads,
+                "nTimedOutAds": self._n_timed_out_ads,
+                "nAdDisclosureMatched": self._n_ad_disclosure_matched,
+                "nAdDisclosureUnmatched": self._n_ad_disclosure_unmatched,
+                "nClickedAdChoices": self._n_clicked_adchoices_links,
+            },
+            "adAttrs": list(self._ad_attrs),
+            "visitedAdUrls": list(self._visited_ad_urls),
+            "unmatchedAdDisclosureContents": list(self._unmatched_ad_disclosure_contents),
+        }
 
     async def collect(self, page: Page) -> dict:
         try:
@@ -757,37 +656,35 @@ class AdCollector:
         except Exception as exc:
             self._logger.debug(f"[AdCollector] Could not register disclosure collector: {exc}")
 
-        try:
-            await page.wait_for_load_state("networkidle", timeout=12_000)
-        except Exception:
-            pass
-
-        # await self._scroll_page(page)
-
-        try:
-            await page.wait_for_timeout(1500)
-        except Exception:
-            pass
+        # Scroll page to trigger lazy loaded ads and dynamic ad networks
+        await self._scroll_page(page)
 
         ads = await self._find_ads(page)
+        self._detected_ads = ads
         ads.sort(key=lambda item: (item.get("y", 0), item.get("x", 0)))
         self._logger.info(f"[AdCollector] Detected {len(ads)} candidate ad element(s)")
+        for idx, ad_item in enumerate(ads):
+            node_tag = ad_item.get('nodeType', '')
+            node_id = f"#{ad_item['id']}" if ad_item.get('id') else ""
+            rule_str = ad_item.get('matchedRule', 'unknown')
+            self._logger.debug(
+                f"[AdCollector] Candidate {idx}: {node_tag}{node_id} ({int(ad_item.get('width', 0))}x{int(ad_item.get('height', 0))}) [rule: {rule_str}]"
+            )
         ad_attrs, scrape_results = await self._capture_ads(page, ads)
+        self._ad_attrs = ad_attrs
+        self._scrape_results = scrape_results
 
         self._ad_disclosures_contents = await self._ad_disclosure_collector.collect(page)
 
         n_matched, n_unmatched = self._match_adchoice_link(ad_attrs)
+        self._n_ad_disclosure_matched = n_matched
+        self._n_ad_disclosure_unmatched = n_unmatched
         scrape_results["nAdDisclosureMatched"] = n_matched
         scrape_results["nAdDisclosureUnmatched"] = n_unmatched
         scrape_results["nClickedAdChoices"] = self._n_clicked_adchoices_links
 
         self._logger.info(f"[AdCollector] Captured {len(ad_attrs)} ad screenshot(s)")
-        return {
-            "scrapeResults": scrape_results,
-            "adAttrs": ad_attrs,
-            "visitedAdUrls": self._visited_ad_urls,
-            "unmatchedAdDisclosureContents": self._unmatched_ad_disclosure_contents,
-        }
+        return self.get_partial_results()
 
     async def _click_any_page_adchoice_fallback(self, page: Page) -> str:
         contexts: list[Page | Frame] = [page, *page.frames]
@@ -910,58 +807,19 @@ class AdCollector:
     # ------------------------------------------------------------------
 
     async def _scroll_page(self, page: Page) -> None:
-        start_ms = asyncio.get_event_loop().time() * 1000
-        max_time_ms = self.SCROLL_TIMEOUT_MS
-        step = 400
-        max_height = 30000
-        delay_pass1 = 500
-        delay_pass2 = 200
-        wait_after_pass1 = 2500
-
-        def elapsed_ms() -> float:
-            return asyncio.get_event_loop().time() * 1000 - start_ms
-
-        timed_out = False
-
         try:
-            pos = 0
-            scroll_height = await page.evaluate("() => Math.min(document.body.scrollHeight, %s)" % max_height)
+            scroll_height = await page.evaluate("() => Math.min(document.body.scrollHeight || document.documentElement.scrollHeight, 12000)")
             scroll_height = int(scroll_height or 0)
-
-            # Pass 1: slow downward sweep
-            while pos <= scroll_height and elapsed_ms() < max_time_ms:
+            step = 600
+            for pos in range(0, scroll_height + 1, step):
                 await page.evaluate(f"() => window.scrollTo(0, {pos})")
-                await page.wait_for_timeout(delay_pass1)
-                pos += step
-                scroll_height = int(await page.evaluate("() => Math.min(document.body.scrollHeight, %s)" % max_height) or 0)
+                await page.wait_for_timeout(80)
 
-            # Wait for lazy content triggered in pass 1
-            await page.wait_for_timeout(wait_after_pass1)
-
-            # Pass 2: faster forward sweep starting from current scroll position
-            pos = int(await page.evaluate("() => window.scrollY") or 0)
-            scroll_height = int(await page.evaluate("() => Math.min(document.body.scrollHeight, %s)" % max_height) or 0)
-            while pos <= scroll_height and elapsed_ms() < max_time_ms:
-                await page.evaluate(f"() => window.scrollTo(0, {pos})")
-                await page.wait_for_timeout(delay_pass2)
-                pos += step * 2
-                scroll_height = int(await page.evaluate("() => Math.min(document.body.scrollHeight, %s)" % max_height) or 0)
-
-            # Reset back to top so capture operations are consistent
-            await page.evaluate("() => window.scrollTo(0, 0)")
             await page.wait_for_timeout(300)
-
-            if elapsed_ms() >= max_time_ms:
-                timed_out = True
-
+            await page.evaluate("() => window.scrollTo(0, 0)")
+            await page.wait_for_timeout(200)
         except Exception as exc:
             self._logger.warning(f"[AdCollector] Scroll error: {exc}")
-            return
-
-        if timed_out:
-            self._logger.warning(
-                f"[AdCollector] Scroll timed out after {self.SCROLL_TIMEOUT_MS} ms; proceeding with current page state"
-            )
 
     async def _find_ads(self, page: Page) -> list:
         try:
@@ -1075,8 +933,8 @@ class AdCollector:
             }""",
             bbox,
         )
-        # Give the page some time to layout after scrolling.
-        await page.wait_for_timeout(250)
+        # Give the page a brief moment to layout after scrolling.
+        await page.wait_for_timeout(100)
 
     async def _viewport_clip_from_bbox(self, page: Page, bbox: dict) -> dict | None:
         """Return a clip rectangle for screenshot based on the current viewport.
@@ -1122,7 +980,7 @@ class AdCollector:
         # This uniformly avoids elements being obscured by sticky top-headers OR sticky bottom-footers,
         # without randomly pushing ads out of the viewport.
         await self._scroll_bbox_into_view(page, bbox)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(150)
 
         # After scrolling, the ad might have moved or resized (especially if it is a sticky element itself).
         # Re-calculate bounding box.
@@ -1143,12 +1001,6 @@ class AdCollector:
 
         clip = await self._viewport_clip_from_bbox(page, bbox)
         if clip is None:
-            if element_handle is not None:
-                try:
-                    await element_handle.screenshot(path=str(screenshot_path), timeout=self.ELEMENT_ACTION_TIMEOUT_MS)
-                    return screenshot_path.name, bbox
-                except Exception:
-                    pass
             try:
                 await page.screenshot(path=str(screenshot_path), full_page=False)
                 self._logger.debug(f"[AdCollector] Used viewport screenshot fallback for ad_{index}")
@@ -1282,31 +1134,45 @@ class AdCollector:
         }
 
         if extraction_target:
-            clicked_link, disclosure = await self._click_adchoice_link_in_ad(
-                ad_links_and_images,
-                page,
-                screenshot_name,
-                element_handle=element_handle,
-            )
+            try:
+                clicked_link, disclosure = await asyncio.wait_for(
+                    self._click_adchoice_link_in_ad(
+                        ad_links_and_images,
+                        page,
+                        screenshot_name,
+                        element_handle=element_handle,
+                    ),
+                    timeout=15.0,
+                )
+            except Exception:
+                clicked_link, disclosure = "", None
 
             if not clicked_link:
                 fallback_href = self._pick_adchoice_link(ad_links_and_images)
-                fallback_disclosure = await self._ad_disclosure_collector.open_disclosure_in_new_tab(
-                    page,
-                    fallback_href,
-                    ad_screenshot_name=screenshot_name,
-                )
                 if fallback_href:
+                    try:
+                        fallback_disclosure = await asyncio.wait_for(
+                            self._ad_disclosure_collector.open_disclosure_in_new_tab(
+                                page,
+                                fallback_href,
+                                ad_screenshot_name=screenshot_name,
+                            ),
+                            timeout=12.0,
+                        )
+                    except Exception:
+                        fallback_disclosure = None
                     clicked_link = fallback_href
-                if fallback_disclosure and not disclosure:
-                    disclosure = fallback_disclosure
+                    if fallback_disclosure and not disclosure:
+                        disclosure = fallback_disclosure
 
             if not clicked_link:
                 try:
-                    if extraction_target:
-                        element_screenshot = await extraction_target.screenshot(type="png")
-                        coords = await find_ad_choices_in_screenshot(
-                            element_screenshot, page
+                    ad_img_file = self._output_dir / "ad_images" / screenshot_name
+                    if extraction_target and ad_img_file.is_file():
+                        element_screenshot = ad_img_file.read_bytes()
+                        coords = await asyncio.wait_for(
+                            find_ad_choices_in_screenshot(element_screenshot, page),
+                            timeout=1.0,
                         )
                         if coords:
                             rel_x, rel_y = coords
@@ -1314,9 +1180,9 @@ class AdCollector:
                                 f"[AdCollector] OpenCV fallback: clicking AdChoices icon "
                                 f"at relative ({rel_x:.1f}, {rel_y:.1f}) for ad_{index}"
                             )
-                            async with page.expect_popup(timeout=3000) as popup_info:
-                                await extraction_target.click(position={"x": rel_x, "y": rel_y}, force=True)
                             try:
+                                async with page.expect_popup(timeout=1500) as popup_info:
+                                    await extraction_target.click(position={"x": rel_x, "y": rel_y}, force=True, timeout=1000)
                                 popup_page = await popup_info.value
                                 cv_disclosure = await self._ad_disclosure_collector.capture_disclosure_page(
                                     popup_page,
@@ -1328,7 +1194,7 @@ class AdCollector:
                                     self._n_clicked_adchoices_links += 1
                             except Exception:
                                 cv_disclosures = await self._ad_disclosure_collector.capture_context_disclosures(
-                                    page, ad_screenshot_name=screenshot_name, settle_ms=1000
+                                    page, ad_screenshot_name=screenshot_name, settle_ms=500
                                 )
                                 if cv_disclosures:
                                     disclosure = cv_disclosures[0]
@@ -1349,9 +1215,11 @@ class AdCollector:
 
         await self._download_ad_videos(page, ad_attrs, index)
 
+        matched_rule = ad_attrs.get("matchedRule", "unknown")
         self._logger.info(
             f"[AdCollector] ad_{index}: {ad_attrs['nodeType']}#{ad_attrs['id'] or ''} "
-            f"({int(ad_attrs['width'])}x{int(ad_attrs['height'])})"
+            f"({int(ad_attrs['width'])}x{int(ad_attrs['height'])}) "
+            f"[rule: {matched_rule}]"
         )
         return "scraped", ad_attrs
 
@@ -1360,11 +1228,15 @@ class AdCollector:
         downloaded: list[str] = []
 
         for frame_data in ad_attrs.get("adLinksAndImages", []):
+            if downloaded:
+                break
             for video_entry in frame_data.get("videos", []):
+                if downloaded:
+                    break
                 src = video_entry.get("src", "") if isinstance(video_entry, dict) else ""
                 if not src or not src.startswith(("http://", "https://")):
                     continue
-                if src in downloaded:
+                if src in downloaded or ".m3u8" in src.lower():
                     continue
 
                 ext = Path(src.split("?")[0]).suffix.lower()
@@ -1375,15 +1247,17 @@ class AdCollector:
                 filepath = video_dir / filename
 
                 try:
-                    response = await page.context.request.get(src, timeout=10000)
+                    response = await asyncio.wait_for(
+                        page.context.request.get(src, timeout=2000),
+                        timeout=2.0,
+                    )
                     if response and response.ok:
                         body = await response.body()
-                        filepath.write_bytes(body)
-                        downloaded.append(src)
-                        video_entry["downloadedFile"] = filename
-                        self._logger.info(f"[AdCollector] Downloaded video for ad_{index}: {filename}")
-                    else:
-                        self._logger.debug(f"[AdCollector] Video download failed (HTTP {getattr(response, 'status', '?')}): {src[:120]}")
+                        if len(body) <= 50 * 1024 * 1024:
+                            filepath.write_bytes(body)
+                            downloaded.append(src)
+                            video_entry["downloadedFile"] = filename
+                            self._logger.info(f"[AdCollector] Downloaded video for ad_{index}: {filename}")
                 except Exception as exc:
                     self._logger.debug(f"[AdCollector] Video download error for ad_{index}: {exc}")
 
@@ -1530,6 +1404,7 @@ class AdCollector:
             if self._max_ads_captured is not None and len(ad_details) >= self._max_ads_captured:
                 remaining_ads = len(ads_to_process) - index
                 n_skipped_ads += max(0, remaining_ads)
+                self._n_skipped_ads = n_skipped_ads
                 self._logger.info(
                     f"[AdCollector] Reached max successful captures ({self._max_ads_captured}); skipped {remaining_ads} remaining ad(s)"
                 )
@@ -1537,28 +1412,39 @@ class AdCollector:
             if page.is_closed():
                 remaining_ads = len(ads_to_process) - index
                 n_skipped_ads += remaining_ads
+                self._n_skipped_ads = n_skipped_ads
                 self._logger.warning(
                     f"[AdCollector] Page closed before ad_{index}; skipped {remaining_ads} remaining ad(s)"
                 )
                 break
             try:
-                status, ad_attrs = await self._capture_single_ad(page, ad, index)
+                status, ad_attrs = await asyncio.wait_for(
+                    self._capture_single_ad(page, ad, index),
+                    timeout=self.AD_SCRAPE_TIMEOUT_MS / 1000,
+                )
                 if status == "scraped" and ad_attrs is not None:
                     ad_details.append(ad_attrs)
+                    self._ad_attrs = ad_details
                 elif status == "small":
                     n_small_ads += 1
+                    self._n_small_ads = n_small_ads
                 elif status == "empty":
                     n_empty_ads += 1
+                    self._n_empty_ads = n_empty_ads
                 elif status == "removed":
                     n_removed_ads += 1
+                    self._n_removed_ads = n_removed_ads
             except Exception as exc:
-                if "Timeout" in type(exc).__name__ or "Timeout" in str(exc):
+                if isinstance(exc, asyncio.TimeoutError) or "Timeout" in type(exc).__name__ or "Timeout" in str(exc):
                     n_timed_out_ads += 1
+                    self._n_timed_out_ads = n_timed_out_ads
+                    rule_str = ad.get("matchedRule", "unknown")
                     self._logger.warning(
-                        f"[AdCollector] Timed out scraping ad_{index} after {self.AD_SCRAPE_TIMEOUT_MS} ms"
+                        f"[AdCollector] Timed out scraping ad_{index} ({ad.get('nodeType', '')}#{ad.get('id', '')} [rule: {rule_str}]) after {self.AD_SCRAPE_TIMEOUT_MS} ms"
                     )
                     continue
                 n_removed_ads += 1
+                self._n_removed_ads = n_removed_ads
                 self._logger.warning(f"[AdCollector] Screenshot error for ad_{index}: {exc}")
 
         scrape_results = {
@@ -1570,6 +1456,7 @@ class AdCollector:
             "nSkippedAds": n_skipped_ads,
             "nTimedOutAds": n_timed_out_ads,
         }
+        self._scrape_results = scrape_results
         return ad_details, scrape_results
 
     def _frame_identifier(self, seed: str) -> str:
@@ -1593,238 +1480,6 @@ class AdCollector:
         parent_frame_id: str | None,
         is_main_document: bool,
     ) -> dict:
-        links = await self._eval_all(
-            context,
-            "a",
-            """
-            (links) => links.map((link) => [{
-                googAdUrl: (() => { try { return new URL(link.href).searchParams.get('adurl'); } catch (_) { return null; } })(),
-                href: link.href,
-                outerHTML: link.outerHTML.slice(0, 2000),
-            }])
-            """,
-        )
-        image_links = await self._eval_all(
-            context,
-            "a",
-            """
-            (links) => links
-                .filter((link) => !!link.querySelector('img, picture, svg, canvas, video'))
-                .map((link) => ({
-                    googAdUrl: (() => { try { return new URL(link.href).searchParams.get('adurl'); } catch (_) { return null; } })(),
-                    href: link.href,
-                    imgSrc: (() => {
-                        const media = link.querySelector('img, source, video');
-                        if (!media) return null;
-                        return media.currentSrc || media.src || media.getAttribute('src') || null;
-                    })(),
-                    outerHTML: link.outerHTML.slice(0, 2000),
-                }))
-            """,
-        )
-        other_links = await self._eval_all(
-            context,
-            "a",
-            """
-            (links) => links
-                .filter((link) => !link.querySelector('img, picture, svg, canvas, video'))
-                .map((link) => ({
-                    googAdUrl: (() => { try { return new URL(link.href).searchParams.get('adurl'); } catch (_) { return null; } })(),
-                    href: link.href,
-                    text: (link.innerText || '').trim().slice(0, 500),
-                    outerHTML: link.outerHTML.slice(0, 2000),
-                }))
-            """,
-        )
-        gwd_links = await self._eval_all(
-            context,
-            "gwd-taparea",
-            """
-            (areas) => areas.map((area) => [{
-                googAdUrl: (() => {
-                    try {
-                        const raw = area.getAttribute('exit-override-url') || '';
-                        return new URLSearchParams(raw.split('?')[1] || '').get('adurl');
-                    } catch (_) {
-                        return null;
-                    }
-                })(),
-                href: area.getAttribute('exit-override-url'),
-                outerHTML: area.outerHTML.slice(0, 2000),
-            }])
-            """,
-        )
-        imgs = await self._eval_all(
-            context,
-            "img",
-            """
-            (imgs) => {
-                function getXPath(el) {
-                    if (el.id) {
-                        const safeId = el.id.replace(/"/g, '');
-                        return '//*[@id="' + safeId + '"]';
-                    }
-                    const parts = [];
-                    let node = el;
-                    while (node && node.nodeType === Node.ELEMENT_NODE) {
-                        let idx = 1;
-                        let sib = node.previousSibling;
-                        while (sib) {
-                            if (sib.nodeType === Node.ELEMENT_NODE && sib.tagName === node.tagName) idx++;
-                            sib = sib.previousSibling;
-                        }
-                        parts.unshift(node.tagName.toLowerCase() + '[' + idx + ']');
-                        const parent = node.parentNode;
-                        if (!parent || parent.nodeType !== Node.ELEMENT_NODE) break;
-                        node = parent;
-                    }
-                    return '/' + parts.join('/');
-                }
-
-                return imgs.map((img) => {
-                const box = img.getBoundingClientRect();
-                const src = img.currentSrc || img.src;
-                return {
-                    x: box.x,
-                    y: box.y,
-                    width: box.width,
-                    height: box.height,
-                    src,
-                    outerHTML: img.outerHTML.slice(0, 2000),
-                    origin: {
-                        kind: src && src.startsWith('data:') ? 'inline-data-url' : 'url',
-                        sourceType: 'img-element',
-                        sourceAttribute: 'src',
-                        tagName: img.tagName,
-                        id: img.id || '',
-                        className: typeof img.className === 'string' ? img.className.slice(0, 300) : '',
-                        xpath: getXPath(img),
-                    },
-                };
-                });
-            }
-            """,
-        )
-        bg_imgs = await self._eval_all(
-            context,
-            "*",
-            """
-            (elements) => {
-                function getXPath(el) {
-                    if (el.id) {
-                        const safeId = el.id.replace(/"/g, '');
-                        return '//*[@id="' + safeId + '"]';
-                    }
-                    const parts = [];
-                    let node = el;
-                    while (node && node.nodeType === Node.ELEMENT_NODE) {
-                        let idx = 1;
-                        let sib = node.previousSibling;
-                        while (sib) {
-                            if (sib.nodeType === Node.ELEMENT_NODE && sib.tagName === node.tagName) idx++;
-                            sib = sib.previousSibling;
-                        }
-                        parts.unshift(node.tagName.toLowerCase() + '[' + idx + ']');
-                        const parent = node.parentNode;
-                        if (!parent || parent.nodeType !== Node.ELEMENT_NODE) break;
-                        node = parent;
-                    }
-                    return '/' + parts.join('/');
-                }
-
-                return elements.map((el) => {
-                const bg = el.currentStyle?.backgroundImage || window.getComputedStyle(el).backgroundImage;
-                if (!bg || bg === 'none') {
-                    return null;
-                }
-                const url = bg.replace(/^url\\((.*)\\)$/,'$1').replace(/^['\\"]|['\\"]$/g, '');
-                const box = el.getBoundingClientRect();
-                return {
-                    x: box.x,
-                    y: box.y,
-                    width: box.width,
-                    height: box.height,
-                    src: url,
-                    outerHTML: el.outerHTML.slice(0, 2000),
-                    origin: {
-                        kind: url && url.startsWith('data:') ? 'inline-data-url' : 'url',
-                        sourceType: 'css-background-image',
-                        sourceAttribute: 'background-image',
-                        tagName: el.tagName,
-                        id: el.id || '',
-                        className: typeof el.className === 'string' ? el.className.slice(0, 300) : '',
-                        xpath: getXPath(el),
-                    },
-                };
-                }).filter(Boolean);
-            }
-            """,
-        )
-        videos = await self._eval_all(
-            context,
-            "video",
-            "(videos) => videos.map((video) => ({ src: video.src, width: video.width, height: video.height })).filter((item) => item.src)",
-        )
-        scripts = await self._eval_all(
-            context,
-            "script",
-            "(scripts) => scripts.map((script) => script.src).filter(Boolean)",
-        )
-        iframes = await self._eval_all(
-            context,
-            "iframe",
-            "(iframes) => iframes.map((iframe) => iframe.src).filter(Boolean)",
-        )
-        adchoices_links = await self._eval_all(
-            context,
-            self.ADCHOICES_SELECTOR,
-            "(links) => links.map((link) => link.href).filter(href => href && !href.startsWith('javascript:'))",
-        )
-        adchoices_icon_links = await self._eval_all(
-            context,
-            self.ADCHOICES_ICON_SELECTOR,
-            """
-            (icons) => {
-                const normalize = (raw) => {
-                    if (!raw) return '';
-                    if (raw.startsWith('//')) return location.protocol + raw;
-                    return raw;
-                };
-                const firstUrlInText = (text) => {
-                    if (!text) return '';
-                    const match = String(text).match(/((?:https?:)?\\/\\/[^\\s'\"<>]+)/i);
-                    return match ? normalize(match[1]) : '';
-                };
-
-                return icons
-                    .map((icon) => {
-                        const clickable = icon.closest('a, [onclick], [role="button"], button');
-                        const node = clickable || icon;
-                        const href = normalize(
-                            node?.getAttribute?.('href') ||
-                            node?.href ||
-                            node?.getAttribute?.('data-href') ||
-                            node?.getAttribute?.('data-url') ||
-                            node?.getAttribute?.('data-destination-url') ||
-                            node?.getAttribute?.('data-click-url') ||
-                            ''
-                        );
-                        if (href && !href.startsWith('javascript:')) {
-                            return href;
-                        }
-
-                        const fromOnclick = firstUrlInText(node?.getAttribute?.('onclick') || '');
-                        if (fromOnclick && !fromOnclick.startsWith('javascript:')) {
-                            return fromOnclick;
-                        }
-
-                        return '';
-                    })
-                    .filter(Boolean);
-            }
-            """,
-        )
-
         try:
             if isinstance(context, Frame):
                 deep = await context.evaluate(
@@ -1839,27 +1494,19 @@ class AdCollector:
         except Exception:
             deep = None
 
-        def _merge_unique(existing, incoming, key_fn):
-            seen = {key_fn(item) for item in existing if item is not None}
-            for item in incoming or []:
-                k = key_fn(item)
-                if k in seen:
-                    continue
-                seen.add(k)
-                existing.append(item)
+        if not isinstance(deep, dict):
+            deep = {}
 
-        _merge_unique(adchoices_links, adchoices_icon_links, lambda x: x)
-
-        if isinstance(deep, dict):
-            _merge_unique(links, deep.get("links", []), lambda x: json.dumps(x, sort_keys=True))
-            _merge_unique(image_links, deep.get("imageLinks", []), lambda x: (x or {}).get("href", "") + "|" + str((x or {}).get("imgSrc", "")))
-            _merge_unique(other_links, deep.get("otherLinks", []), lambda x: (x or {}).get("href", ""))
-            _merge_unique(imgs, deep.get("imgs", []), lambda x: (x or {}).get("src", ""))
-            _merge_unique(bg_imgs, deep.get("bgImgs", []), lambda x: (x or {}).get("src", ""))
-            _merge_unique(videos, deep.get("videos", []), lambda x: (x or {}).get("src", ""))
-            _merge_unique(scripts, deep.get("scripts", []), lambda x: x)
-            _merge_unique(iframes, deep.get("iframes", []), lambda x: x)
-            _merge_unique(adchoices_links, deep.get("adChoicesLinks", []), lambda x: x)
+        links = deep.get("links", [])
+        image_links = deep.get("imageLinks", [])
+        other_links = deep.get("otherLinks", [])
+        gwd_links = []
+        imgs = deep.get("imgs", [])
+        bg_imgs = deep.get("bgImgs", [])
+        videos = deep.get("videos", [])
+        scripts = deep.get("scripts", [])
+        iframes = deep.get("iframes", [])
+        adchoices_links = deep.get("adChoicesLinks", [])
 
         adchoices_link_handles: list[ElementHandle] = []
         try:
@@ -2472,7 +2119,7 @@ class AdCollector:
 
         try:
             iframes = await target.query_selector_all("iframe")
-            for iframe in iframes:
+            for iframe in iframes[:3]:
                 res = await self._find_adchoice_handle(iframe, max_depth - 1)
                 if res:
                     return res
@@ -2505,7 +2152,7 @@ class AdCollector:
 
                     const firstUrlInText = (text) => {
                         if (!text) return '';
-                        const match = String(text).match(/((?:https?:)?\\/\\/[^\\s'\"<>]+)/i);
+                        const match = String(text).match(/((?:https?:)?\/\/[^\s'\"<>]+)/i);
                         return match ? normalize(match[1]) : '';
                     };
 
@@ -2523,117 +2170,29 @@ class AdCollector:
                         );
                         if (direct) return direct;
 
-                                        const urlRegex = /((?:https?:)?\/\/[^\s'\"<>]+)/gi;
-                                        const textHints = [
-                                            'why this ad',
-                                            'whythisad',
-                                            'adchoice',
-                                            'adchoices',
-                                            'privacy/adinfo',
-                                            'see more ads by this advertiser',
-                                            'report this ad',
-                                            'criteo',
-                                            'taboola',
-                                            'outbrain',
-                                        ];
-                                        const urlHints = [
-                                            'adssettings.google.com',
-                                            'privacy.us.criteo.com',
-                                            'privacy.eu.criteo.com',
-                                            'criteo',
-                                            'taboola',
-                                            'outbrain',
-                                        ];
-
-                                        const candidateRoots = [
-                                            el,
-                                            el.closest?.('a, [onclick], [role="button"], button') || null,
-                                            el.parentElement || null,
-                                            el.closest?.('div, span, li, section, article, aside, main') || null,
-                                        ].filter(Boolean);
-
-                                        const scoreNode = (node, href) => {
-                                            const html = `${node?.outerHTML || ''}\n${node?.innerText || ''}`.toLowerCase();
-                                            const hrefLower = String(href || '').toLowerCase();
-                                            const urls = Array.from(new Set((html.match(urlRegex) || []).map((raw) => normalize(raw)).filter(Boolean)));
-                                            let score = 0;
-                                            if (html.includes(hrefLower)) score += 1000;
-                                            if (urlHints.some((hint) => hrefLower.includes(hint))) score += 300;
-                                            if (urls.length === 1) score += 900;
-                                            else if (urls.length > 1) score += Math.max(0, 500 - (urls.length * 60));
-                                            if (textHints.some((hint) => html.includes(hint))) score += 250;
-                                            if (html.includes('href=') || html.includes('data-href') || html.includes('data-url') || html.includes('onclick')) score += 100;
-                                            if (html.includes('<iframe')) score += 25;
-                                            if (hrefLower && html.split(hrefLower).length === 2) score += 50;
-                                            return score;
-                                        };
                         const fromOnclick = firstUrlInText(node.getAttribute?.('onclick') || '');
                         if (fromOnclick) return fromOnclick;
 
                         const nestedAnchor = node.querySelector?.('a[href]');
-
-                                        const scored = new Map();
-                                        const consider = (node) => {
-                                            if (!node) return;
-                                            const hrefs = [];
-                                            const add = (raw) => {
-                                                const href = normalize(raw);
-                                                if (!href || href.startsWith('javascript:') || hrefs.includes(href)) return;
-                                                hrefs.push(href);
-                                            };
-
-                                            add(node.getAttribute?.('href') || node.href || '');
-                                            add(node.getAttribute?.('data-href') || node.getAttribute?.('data-url') || node.getAttribute?.('data-destination-url') || node.getAttribute?.('data-click-url') || '');
-                                            add(firstUrlInText(node.getAttribute?.('onclick') || ''));
-
-                                            const nestedAnchor = node.querySelector?.('a[href]');
-                                            if (nestedAnchor) {
-                                                add(nestedAnchor.getAttribute?.('href') || nestedAnchor.href || '');
-                                            }
-
-                                            for (const href of hrefs) {
-                                                const score = scoreNode(node, href);
-                                                const current = scored.get(href);
-                                                if (!current || score > current.score) {
-                                                    scored.set(href, { href, score });
-                                                }
-                                            }
-                                        };
-
-                                        for (const node of candidateRoots) {
-                                            consider(node);
-                                        }
                         if (nestedAnchor) {
+                            return normalize(nestedAnchor.getAttribute?.('href') || nestedAnchor.href || '');
+                        }
+                        return '';
+                    };
+
+                    const candidateRoots = [
+                        el,
+                        el.closest?.('a, [onclick], [role="button"], button') || null,
                         el.parentElement || null,
-                                        const docMatchNodes = [
-                                            ...doc.querySelectorAll(adChoiceSelector),
-                                            ...doc.querySelectorAll('a[href*="whythisad" i], a[href*="adchoice" i], a[href*="privacy/adinfo" i], a[href*="criteo" i], a[href*="taboola" i], a[href*="outbrain" i]'),
-                                        ];
-                                        for (const node of docMatchNodes) {
-                                            consider(node);
-                                        }
+                        el.closest?.('div, span, li, section, article, aside, main') || null,
+                    ].filter(Boolean);
 
-                                        const best = Array.from(scored.values()).sort((a, b) => b.score - a.score)[0];
-                                        if (best) {
-                                            return best.href;
-                                        }
-
-                                        for (const node of candidateRoots) {
-                                            const href = fromNode(node);
-                                            if (href) return href;
-                                        }
-
-                                        const docMatch = docMatchNodes[0] || null;
-                                        return fromNode(docMatch);
+                    for (const node of candidateRoots) {
                         const href = fromNode(node);
                         if (href) return href;
                     }
 
-                    const doc = el?.ownerDocument || document;
-                    const docMatch =
-                        doc.querySelector(adChoiceSelector) ||
-                        doc.querySelector('a[href*="whythisad" i], a[href*="adchoice" i], a[href*="privacy/adinfo" i]');
-                    return fromNode(docMatch);
+                    return '';
                 }
                 """,
                 self.ADCHOICES_SELECTOR,

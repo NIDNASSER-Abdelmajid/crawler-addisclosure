@@ -1,14 +1,19 @@
+from typing import TYPE_CHECKING
 from Helpers.inclusion_tree import InclusionTreeBuilder
 from Helpers.inclusion_tree_visualizer import visualize_tree
+
+if TYPE_CHECKING:
+    from Helpers.crawl_context import CrawlContext
 
 
 class InclusionTreeCollector:
     COLLECTOR_NAME = "InclusionTreeCollector"
 
-    def init(self, output_dir: str, logger, url_hash: str) -> None:
+    def init(self, output_dir: str, logger, url_hash: str, crawl_context: CrawlContext | None = None) -> None:
         self._output_dir = output_dir
         self._logger = logger
         self._url_hash = url_hash
+        self._crawl_context = crawl_context
         self._builder = InclusionTreeBuilder(logger=logger)
         self._ready = False
 
@@ -50,16 +55,6 @@ class InclusionTreeCollector:
             self._logger.warning("[InclusionTreeCollector] pre_crawl was not called; skipping")
             return {"inclusionTrees": [], "nTrees": 0, "nNodes": 0}
 
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:
-            pass
-
-        try:
-            await page.wait_for_timeout(1000)
-        except Exception:
-            pass
-
         await self._cdp.detach()
 
         trees = self._builder.build_trees()
@@ -78,9 +73,29 @@ class InclusionTreeCollector:
             except Exception as exc:
                 self._logger.debug(f"[InclusionTreeCollector] failed to render visualisation: {exc}")
 
-        return {
+        res = {
             "inclusionTrees": trees,
             "nTrees": len(trees),
             "nNodes": node_count,
             "visualisations": visualisations,
         }
+        if self._crawl_context:
+            res["document_id"] = self._crawl_context.document_id
+        return res
+
+    def get_partial_results(self) -> dict:
+        """Return inclusion tree structure built from captured events so far."""
+        try:
+            trees = self._builder.build_trees()
+            node_count = sum(self._builder.count_nodes(tree) for tree in trees)
+            res = {
+                "inclusionTrees": trees,
+                "nTrees": len(trees),
+                "nNodes": node_count,
+                "visualisations": [],
+            }
+            if self._crawl_context:
+                res["document_id"] = self._crawl_context.document_id
+            return res
+        except Exception:
+            return {"inclusionTrees": [], "nTrees": 0, "nNodes": 0, "visualisations": []}

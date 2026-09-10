@@ -8,22 +8,28 @@ venv/
 # Logs and temp runtime files
 *.log
 .pw_data_dir/
+browsers/
 
 # OS/editor metadata
 .DS_Store
 Thumbs.db
 .vscode/
 .claude/
+.agents/
+.pytest_cache/
 
-# Frontend/runtime artifacts
-node_modules/
-dashboard-vite/.electron-data/
-
-# Databases
+# Databases and runtime safeguard state
 *.sqlite
 *.db
+*.db-shm
+*.db-wal
+*.lock
+resources/safeguard_state.db*
+resources/safeguard_audit.jsonl
+resources/emergency_save_failures.log
 
-# Data and output directories
+# Crawl data and output directories
+crawl/
 data/
 data_*/
 results/
@@ -32,6 +38,53 @@ kids_results/
 kids_results_*/
 tmp_upstream/
 remove/
+processed/
+outputss/
+temp_results/
+temp_results_*/
+test_results/
+test_results_*/
+test_urls/
+test_urls_*/
+urls/
+kids_dataset_*/
+cv_based_crawl/
+link_based_crawl/
+yahoo_temp_test*/
+forbes_temp_test*/
+test_test_test*/
+temps/
+test/
+scratch/
+assets/
+figures/
+docs/
+dashboard-vite/
+web/
+database/
+ad_disclosure_analysis_output/
+
+# Root-level media, HTML, PDF and images
+/*.png
+/*.jpg
+/*.jpeg
+/*.svg
+/*.webp
+/*.html
+/*.pdf
+
+# Root-level data/text files
+/example.csv
+/sw2 copy.csv
+/urls_crawl.csv
+/urls.txt
+/test_urls.csv
+/TODO.txt
+/definitions.txt
+/ap_code.txt
+/cmp.md
+/DATA_FIELDS_AND_MINIMIZATION_REPORT.md
+/SAMPLE_DATA_ANALYSIS.md
 
 # Generated analysis outputs and scratch files
 ad_cluster_units.json
@@ -39,6 +92,8 @@ ad_features_clusters.json
 ad_features_similarity.json
 addisclosures.json
 addisclosures_with_clusters.json
+kids_results_*.json
+kids_dataset_*.json
 final_summary.json
 sw.csv
 sw2.csv
@@ -54,6 +109,25 @@ analytics.txt
 steps.md
 commands.txt
 debug.txt
+
+# Non-crawler scripts & analysis tools
+analyze_ad_features.py
+extract_addisclosures.py
+extract_pipeline.py
+generate_analysis_notebook.py
+generate_nb.py
+generate_urls_crawl.py
+import_crawl_data.py
+check_structure.py
+script.py
+AdCollector_head.py
+AdCollector_head_utf8.py
+AdCollector_ref.js
+utils_ref.js
+test_all_collectors.py
+test_all_collectors_quiet.py
+test_suite.py
+tests/test_data_importer.py
 
 # Notebook checkpoints
 .ipynb_checkpoints/

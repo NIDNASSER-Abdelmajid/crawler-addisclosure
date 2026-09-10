@@ -1,4 +1,4 @@
-﻿"""
+"""
 Helpers/easylist_updater.py
 ---------------------------
 Fetches ALL rules from the full EasyList (easylist.txt) and saves them to
@@ -49,7 +49,20 @@ _NETWORK_FILE   = _RESOURCES_DIR / "easylist_network_rules.json"
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_and_parse(url: str, timeout: int = 60) -> tuple[list[str], list[str]]:
+def _load_skip_rules() -> list[str]:
+    """Load skip_rules from existing easylist_selectors.json or return default."""
+    if _SELECTORS_FILE.is_file():
+        try:
+            data = json.loads(_SELECTORS_FILE.read_text(encoding="utf-8"))
+            rules = data.get("skip_rules")
+            if isinstance(rules, list) and rules:
+                return rules
+        except Exception:
+            pass
+    return ["a[href][target*=\"blank\"]"]
+
+
+def _fetch_and_parse(url: str, timeout: int = 60, skip_rules: list[str] | None = None) -> tuple[list[str], list[str]]:
     """
     Download the full EasyList file and split it into two rule sets.
 
@@ -77,6 +90,7 @@ def _fetch_and_parse(url: str, timeout: int = 60) -> tuple[list[str], list[str]]
     network_rules: list[str] = []
     seen_sel: set[str] = set()
     seen_net: set[str] = set()
+    skip_set = set(skip_rules or _load_skip_rules())
 
     for line in text.splitlines():
         line = line.strip()
@@ -100,9 +114,23 @@ def _fetch_and_parse(url: str, timeout: int = 60) -> tuple[list[str], list[str]]
             if not sel or sel.startswith("^") or sel.startswith(":has(") or \
                sel.startswith(":not(:has") or sel.startswith(":matches-css"):
                 continue
-            # Skip bare structural element type selectors (html, body, head, etc.)
-            _STRUCTURAL = frozenset({'html', 'head', 'body', 'script', 'style', 'meta', 'link', 'title', 'noscript'})
-            if sel.lower() in _STRUCTURAL:
+
+            # Skip explicitly blacklisted / overly-broad skip_rules
+            if sel in skip_set or sel.lower() in skip_set:
+                continue
+
+            # Skip bare structural HTML tags and overly-broad layout selectors (e.g. #header, .sidebar)
+            # that cause entire non-ad page sections to be captured when domain qualifiers are stripped
+            _OVERLY_BROAD = frozenset({
+                'html', 'head', 'body', 'script', 'style', 'meta', 'link', 'title', 'noscript',
+                'header', 'footer', 'sidebar', 'content', 'main', 'nav', 'menu', 'wrapper', 'container',
+                'left', 'right', 'top', 'bottom', 'center', 'article', 'section', 'aside',
+                '#header', '#footer', '#sidebar', '#top', '#bottom', '#left', '#right', '#content',
+                '#main', '#nav', '#wrapper', '#container', '#center', '#article', '#section',
+                '.header', '.footer', '.sidebar', '.content', '.main', '.nav', '.menu', '.wrapper',
+                '.container', '.left', '.right', '.top', '.bottom', '.center', '.article', '.section',
+            })
+            if sel.lower() in _OVERLY_BROAD or sel.lower().strip('.#') in _OVERLY_BROAD:
                 continue
 
             if sel not in seen_sel:
@@ -122,13 +150,14 @@ def _fetch_and_parse(url: str, timeout: int = 60) -> tuple[list[str], list[str]]
     return selectors, network_rules
 
 
-def _save_selectors(selectors: list[str], source_url: str) -> None:
+def _save_selectors(selectors: list[str], source_url: str, skip_rules: list[str] | None = None) -> None:
     """Persist CSS selectors to resources/easylist_selectors.json."""
     _RESOURCES_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "last_updated": datetime.now().isoformat(),
         "source":       source_url,
         "count":        len(selectors),
+        "skip_rules":   skip_rules if skip_rules is not None else _load_skip_rules(),
         "selectors":    selectors,
     }
     _SELECTORS_FILE.write_text(
@@ -160,6 +189,7 @@ def update_selectors(
     url: str = EASYLIST_URL,
     verbose: bool = True,
     timeout: int = 60,
+    skip_rules: list[str] | None = None,
 ) -> dict:
     """
     Fetch the full EasyList, parse all rule types, and save to resources/.
@@ -175,16 +205,17 @@ def update_selectors(
             "network_rules": <int>,   # unique network rules saved
         }
     """
+    effective_skip_rules = skip_rules if skip_rules is not None else _load_skip_rules()
     if verbose:
         print(f"[EasyList] Fetching full EasyList from:\n  {url}", flush=True)
 
     try:
-        selectors, network_rules = _fetch_and_parse(url, timeout=timeout)
+        selectors, network_rules = _fetch_and_parse(url, timeout=timeout, skip_rules=effective_skip_rules)
     except Exception as exc:
         print(f"[EasyList] ERROR -- fetch failed: {exc}", file=sys.stderr)
         return {"selectors": 0, "network_rules": 0, "error": str(exc)}
 
-    _save_selectors(selectors, url)
+    _save_selectors(selectors, url, skip_rules=effective_skip_rules)
     _save_network_rules(network_rules, url)
 
     stats = {

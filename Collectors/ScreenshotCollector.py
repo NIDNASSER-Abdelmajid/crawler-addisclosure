@@ -12,24 +12,24 @@ screenshot_<hash>.jpg   Full-page JPEG (quality 75)
 """
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from playwright.async_api import Page
+
+if TYPE_CHECKING:
+    from Helpers.crawl_context import CrawlContext
 
 
 class ScreenshotCollector:
     COLLECTOR_NAME = "ScreenshotCollector"
 
-    def init(self, output_dir: str, logger, url_hash: str) -> None:
+    def init(self, output_dir: str, logger, url_hash: str, crawl_context: CrawlContext | None = None) -> None:
         self._output_dir = Path(output_dir)
         self._logger = logger
         self._url_hash = url_hash
+        self._crawl_context = crawl_context
 
     async def collect(self, page: Page) -> list:
-        try:
-            await page.wait_for_load_state("networkidle", timeout=12_000)
-        except Exception:
-            pass
-
         screenshot_path = self._output_dir / f"screenshot_{self._url_hash}.jpg"
         try:
             # Removed scrollTo(0, 0) to maintain consistency with AdCollector position
@@ -90,4 +90,17 @@ class ScreenshotCollector:
                 self._logger.error(f"[ScreenshotCollector] Screenshot fallback failed: {fallback_exc}")
                 screenshot_path = None
 
-        return [{"screenshot": str(screenshot_path)}] if screenshot_path else []
+        if not screenshot_path:
+            return []
+
+        event_seq = self._crawl_context.event_counter.next() if self._crawl_context else None
+        document_id = self._crawl_context.document_id if self._crawl_context else None
+        record = {
+            "screenshot": str(screenshot_path),
+            "filename": Path(screenshot_path).name,
+        }
+        if event_seq is not None:
+            record["event_seq"] = event_seq
+        if document_id is not None:
+            record["document_id"] = document_id
+        return [record]

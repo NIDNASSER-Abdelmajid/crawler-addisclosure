@@ -18,17 +18,19 @@ def load_selectors() -> list[str]:
     """
     Return the current CSS selector list.
     Reads from ``resources/easylist_selectors.json`` when available;
+    excludes any rules specified in ``skip_rules``;
     otherwise returns the built-in fallback list below.
     """
     if _SELECTORS_FILE.is_file():
         try:
             data = json.loads(_SELECTORS_FILE.read_text(encoding="utf-8"))
-            selectors = data.get("selectors", [])
+            skip_rules = set(data.get("skip_rules", ["a[href][target*=\"blank\"]"]))
+            selectors = [s for s in data.get("selectors", []) if s not in skip_rules]
             if selectors:
                 return selectors
         except Exception:
             pass
-    return list(_BUILTIN_SELECTORS)
+    return [s for s in _BUILTIN_SELECTORS if s not in {"a[href][target*=\"blank\"]"}]
 
 
 # # ---------------------------------------------------------------------------

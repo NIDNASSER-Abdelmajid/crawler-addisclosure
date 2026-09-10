@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from urllib.parse import urlparse
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from Helpers.crawl_context import CrawlContext
 
 from Helpers.fingerprint_detection import fingerprint_detection_script
 
@@ -11,10 +16,11 @@ class FingerprintCollector:
     COLLECTOR_NAME = "FingerprintCollector"
     BINDING_NAME = "calledAPIEvent"
 
-    def init(self, output_dir: str, logger, url_hash: str) -> None:
+    def init(self, output_dir: str, logger, url_hash: str, crawl_context: CrawlContext | None = None) -> None:
         self._output_dir = output_dir
         self._logger = logger
         self._url_hash = url_hash
+        self._crawl_context = crawl_context
         self._stats: dict[str, dict[str, int]] = {}
         self._calls: list[dict] = []
         self._ready = False
@@ -40,15 +46,27 @@ class FingerprintCollector:
             source_stats = self._stats.setdefault(source, {})
             source_stats[description] = source_stats.get(description, 0) + 1
 
-            self._calls.append(
-                {
-                    "source": source,
-                    "description": description,
-                    "arguments": api_call.get("args"),
-                    "returnValue": api_call.get("retVal"),
-                    "accessType": api_call.get("accessType"),
-                }
-            )
+            event_seq = self._crawl_context.event_counter.next() if self._crawl_context else None
+            document_id = self._crawl_context.document_id if self._crawl_context else None
+            ts_ms = api_call.get("timestamp_ms") or int(time.time() * 1000)
+            frame_url = api_call.get("frameUrl")
+
+            entry = {
+                "source": source,
+                "description": description,
+                "arguments": api_call.get("args"),
+                "returnValue": api_call.get("retVal"),
+                "accessType": api_call.get("accessType"),
+                "timestamp_ms": ts_ms,
+            }
+            if event_seq is not None:
+                entry["event_seq"] = event_seq
+            if document_id is not None:
+                entry["document_id"] = document_id
+            if frame_url:
+                entry["frame_url"] = frame_url
+
+            self._calls.append(entry)
 
         await page.expose_function(self.BINDING_NAME, _called_api_event)
         await page.add_init_script(fingerprint_detection_script(self.BINDING_NAME))
@@ -89,3 +107,13 @@ class FingerprintCollector:
             f"from {len(call_stats)} source(s)"
         )
         return {"callStats": call_stats, "savedCalls": saved_calls}
+
+    def get_partial_results(self) -> dict:
+        """Synchronously return captured fingerprinting events."""
+        call_stats = {
+            source: stats
+            for source, stats in self._stats.items()
+            if self._is_acceptable_url(source)
+        }
+        saved_calls = [call for call in self._calls if self._is_acceptable_url(call.get("source", ""))]
+        return {"callStats": call_stats, "savedCalls": saved_calls}

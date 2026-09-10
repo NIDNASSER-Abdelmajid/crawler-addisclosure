@@ -1,3 +1,4 @@
+import argparse
 import json
 import re
 from collections import Counter
@@ -7,6 +8,8 @@ from urllib.parse import urlparse
 
 import requests
 
+_DEFAULT_CACHE_PATH = Path(__file__).resolve().parent.parent / "resources" / "domain_categories.json"
+
 
 def _normalize_domain(value: str) -> str:
     raw = (value or "").strip()
@@ -15,7 +18,7 @@ def _normalize_domain(value: str) -> str:
 
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
     host = (parsed.netloc or parsed.path).strip().lower()
-    host = host.split("/")[0]
+    host = host.split("/")[0].split(":")[0]
     if host.startswith("www."):
         host = host[4:]
     return host
@@ -28,11 +31,13 @@ class WebsiteCategorizer:
         headless: bool = True,
         timeout_ms: int = 8000,
         cache_path: Optional[Path] = None,
+        use_cache: bool = True,
     ) -> None:
         self.enabled = enabled
         self.headless = headless
         self.timeout_ms = timeout_ms
-        self.cache_path = cache_path
+        self.use_cache = use_cache
+        self.cache_path = Path(cache_path) if cache_path else (_DEFAULT_CACHE_PATH if use_cache else None)
         self._cache: dict[str, str] = {}
         self._dirty = False
 
@@ -41,8 +46,14 @@ class WebsiteCategorizer:
         self._context = None
         self._page = None
 
-        if self.cache_path:
+        if self.use_cache and self.cache_path:
             self._load_cache()
+
+    def __enter__(self) -> WebsiteCategorizer:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     def _load_cache(self) -> None:
         try:
@@ -60,12 +71,15 @@ class WebsiteCategorizer:
     def flush_cache(self) -> None:
         if not self.cache_path or not self._dirty:
             return
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(
-            json.dumps(self._cache, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        self._dirty = False
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_path.write_text(
+                json.dumps(self._cache, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self._dirty = False
+        except Exception:
+            pass
 
     def close(self) -> None:
         self.flush_cache()
@@ -100,13 +114,12 @@ class WebsiteCategorizer:
 
         try:
             self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(headless=self.headless)
+            self._browser = self._pw.chromium.launch(
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
             self._context = self._browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                )
+                viewport={"width": 1280, "height": 800},
             )
             self._page = self._context.new_page()
             return True
@@ -140,17 +153,26 @@ class WebsiteCategorizer:
         except Exception:
             return ""
 
-        # The old workflow clicks the check button once before reading category cells.
+        try:
+            url_input = page.locator('input[name="url"]').first
+            if url_input.count() > 0:
+                url_input.fill(domain)
+        except Exception:
+            pass
+
+        # The workflow clicks the check button once before reading category cells.
         click_xpaths = [
+            'input[value="Check URL"]',
             "/html/body/div[1]/div[3]/div[2]/div[2]/div/div/div/div[2]/div[1]/div/form[1]/table/tbody/tr[4]/td/div/input",
             "//input[contains(@value,'Check URL')]",
             "//button[contains(.,'Check URL')]",
         ]
         for xp in click_xpaths:
             try:
-                locator = page.locator(f"xpath={xp}").first
+                locator = page.locator(f"xpath={xp}" if xp.startswith(("/", "//")) else xp).first
                 if locator.count() > 0:
                     locator.click(timeout=min(2500, self.timeout_ms))
+                    page.wait_for_timeout(1500)
                     break
             except Exception:
                 continue
@@ -208,7 +230,7 @@ class WebsiteCategorizer:
         scores: Counter[str] = Counter()
         for category, keywords in keyword_map.items():
             for kw in keywords:
-                if kw in text:
+                if re.search(r"\b" + re.escape(kw) + r"\b", text):
                     scores[category] += 1
 
         if not scores:
@@ -283,3 +305,129 @@ class WebsiteCategorizer:
         self._cache[domain] = category
         self._dirty = True
         return category
+
+    def get_categories(self, values: list[str]) -> dict[str, str]:
+        """Categorize a list of websites or domain names."""
+        results: dict[str, str] = {}
+        for val in values:
+            domain = _normalize_domain(val)
+            if domain:
+                results[domain] = self.get_category(domain)
+        return results
+
+    def process_csv(
+        self,
+        input_csv_path: Path,
+        output_csv_path: Optional[Path] = None,
+    ) -> int:
+        """Process a CSV with schema (index,inputDomain,category,finalUrl,statusCode,adsTxt)
+        filling in missing categories.
+        """
+        import csv
+
+        input_path = Path(input_csv_path)
+        if not input_path.is_file():
+            raise FileNotFoundError(f"Input CSV not found: {input_path}")
+
+        fieldnames = ["index", "inputDomain", "category", "finalUrl", "statusCode", "adsTxt"]
+        rows = []
+        with input_path.open("r", encoding="utf-8", newline="") as fp:
+            reader = csv.DictReader(fp)
+            # Use reader fieldnames or default to standard schema
+            actual_fieldnames = list(reader.fieldnames) if reader.fieldnames else fieldnames
+            for row in reader:
+                domain = row.get("inputDomain") or row.get("domain") or ""
+                if domain and not row.get("category"):
+                    row["category"] = self.get_category(domain)
+                rows.append(row)
+
+        out_path = Path(output_csv_path) if output_csv_path else input_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=actual_fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        self.flush_cache()
+        return len(rows)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Classify website domains into content categories."
+    )
+    parser.add_argument(
+        "--domain", "-d",
+        nargs="+",
+        help="One or more domain names or URLs to categorize (space-separated list).",
+    )
+    parser.add_argument(
+        "--input-file", "-f",
+        help="Path to a text or CSV file containing a list of domains (e.g. c-websites.csv or adLikelyUrls3.csv).",
+    )
+    parser.add_argument(
+        "--output-csv", "-o",
+        help="Path to output updated CSV with populated categories.",
+    )
+    parser.add_argument(
+        "--cache-file",
+        default=str(_DEFAULT_CACHE_PATH),
+        help=f"Path to domain categories JSON cache file (default: {_DEFAULT_CACHE_PATH}).",
+    )
+    parser.add_argument(
+        "--show-browser",
+        action="store_true",
+        help="Show browser window during lookup (headed mode to pass bot challenges).",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable reading from persistent cache.",
+    )
+
+    args = parser.parse_args()
+
+    cache_path = None if args.no_cache else Path(args.cache_file)
+
+    with WebsiteCategorizer(
+        headless=not args.show_browser,
+        cache_path=cache_path,
+        use_cache=not args.no_cache,
+    ) as categorizer:
+        if args.input_file and (args.input_file.endswith(".csv") or args.output_csv):
+            in_path = Path(args.input_file)
+            out_path = Path(args.output_csv) if args.output_csv else None
+            # Check if it has inputDomain column or header
+            sample = in_path.read_text(encoding="utf-8", errors="replace")[:1000]
+            if "inputDomain" in sample or "," in sample:
+                count = categorizer.process_csv(in_path, out_path)
+                print(f"Processed {count} rows in CSV: {in_path} -> {out_path or in_path}")
+                return
+
+        domains: list[str] = []
+        if args.input_file:
+            path = Path(args.input_file)
+            if path.is_file():
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    d = line.strip().split(",")[0].strip()
+                    if d and not d.startswith("#") and d != "index" and d != "inputDomain":
+                        domains.append(d)
+
+        if args.domain:
+            domains.extend(args.domain)
+
+        if not domains:
+            domains = [
+                "cnn.com", "github.com", "espn.com", "harvard.edu",
+            ]
+
+        print(f"{'Domain':<25} | {'Category'}")
+        print("-" * 50)
+        results = categorizer.get_categories(domains)
+        for domain, cat in results.items():
+            print(f"{domain:<25} | {cat}")
+
+
+if __name__ == "__main__":
+    main()
+

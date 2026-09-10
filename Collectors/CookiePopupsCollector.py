@@ -225,13 +225,9 @@ class CookiePopupsCollector:
             self._logger.warning(f"[{self.COLLECTOR_NAME}] pre_crawl was not called — skipping")
             return {"cmps": [], "scrapedFrames": []}
 
-        # Give autoconsent time to finish detecting and scraping
+        # Give autoconsent brief time to finish detecting and scraping
         try:
-            await page.wait_for_timeout(5000)
-        except Exception:
-            pass
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8_000)
+            await page.wait_for_timeout(1000)
         except Exception:
             pass
 
@@ -335,3 +331,44 @@ class CookiePopupsCollector:
             })
 
         return results
+
+    def get_partial_results(self) -> list[dict]:
+        """Return detected CMPs and scraped popups captured so far."""
+        detected = [m for m in getattr(self, "_messages", []) if m.get("type") == "cmpDetected"]
+        found    = [m for m in getattr(self, "_messages", []) if m.get("type") == "popupFound"]
+        done     = [m for m in getattr(self, "_messages", []) if m.get("type") == "autoconsentDone"]
+        errors   = [m for m in getattr(self, "_messages", []) if m.get("type") == "autoconsentError"]
+
+        results: list[dict] = []
+        seen: set[str] = set()
+
+        for msg in detected:
+            cmp = msg.get("cmp", "unknown")
+            if cmp in seen:
+                continue
+            seen.add(cmp)
+            results.append({
+                "name":            cmp,
+                "open":            any(f.get("cmp") == cmp for f in found),
+                "final":           any(d.get("cmp") == cmp for d in done),
+                "action":          getattr(self, "_auto_action", "in"),
+                "patterns":        sorted(getattr(self, "_patterns", set())),
+                "snippets":        sorted(getattr(self, "_snippets", set())),
+                "filterListMatch": False,
+                "errors":          [e.get("details", str(e)) for e in errors],
+            })
+
+        if not results and (getattr(self, "_patterns", None) or getattr(self, "_snippets", None)):
+            results.append({
+                "name":            "",
+                "open":            False,
+                "final":           False,
+                "action":          getattr(self, "_auto_action", "in"),
+                "patterns":        sorted(getattr(self, "_patterns", set())),
+                "snippets":        sorted(getattr(self, "_snippets", set())),
+                "filterListMatch": False,
+                "errors":          [],
+            })
+
+        return results
+

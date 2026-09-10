@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from Helpers.crawl_context import CrawlContext
 
 
 class TargetCollector:
     COLLECTOR_NAME = "TargetCollector"
 
-    def init(self, output_dir: str, logger, url_hash: str) -> None:
+    def init(self, output_dir: str, logger, url_hash: str, crawl_context: CrawlContext | None = None) -> None:
         self._output_dir = Path(output_dir)
         self._logger = logger
         self._url_hash = url_hash
+        self._crawl_context = crawl_context
         self._targets: list[dict] = []
         self._seen: set[tuple[str, str]] = set()
         self._ready = False
@@ -36,7 +42,18 @@ class TargetCollector:
         if key in self._seen:
             return
         self._seen.add(key)
-        self._targets.append({"type": target_type, "url": url})
+
+        ts_ms = int(time.time() * 1000)
+        event_seq = self._crawl_context.event_counter.next() if self._crawl_context else None
+
+        item = {
+            "type": target_type,
+            "url": url,
+            "discovered_at_ms": ts_ms,
+        }
+        if event_seq is not None:
+            item["event_seq"] = event_seq
+        self._targets.append(item)
 
     def _snapshot_page_targets(self, page) -> None:
         self._add_target("page", getattr(page, "url", ""))
@@ -112,3 +129,8 @@ class TargetCollector:
 
         self._logger.info(f"[{self.COLLECTOR_NAME}] Collected {len(self._targets)} target(s)")
         return list(self._targets)
+
+    def get_partial_results(self) -> list[dict]:
+        """Return list of captured targets."""
+        return list(self._targets)
+
