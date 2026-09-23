@@ -13,12 +13,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+# Prevent Playwright from hanging on web fonts during screenshot captures
+os.environ["PW_TEST_SCREENSHOT_NO_FONTS_READY"] = "1"
+
 from Helpers.anti_bot import anti_bot_script
 from Helpers.crawl_context import (
     SCHEMA_VERSION,
     CrawlContext,
     EventCounter,
     generate_document_id,
+    Phase,
 )
 
 from playwright.async_api import (
@@ -35,6 +39,7 @@ except ImportError:
     _STEALTH_AVAILABLE = False
 
 from Collectors.AdCollector import AdCollector
+from Collectors.AdDisclosureCollector import AdDisclosureCollector
 from Collectors.APICallCollector import APICallCollector
 from Collectors.CookieCollector import CookieCollector
 from Collectors.CookiePopupsCollector import CookiePopupsCollector
@@ -43,9 +48,11 @@ from Collectors.InclusionTreeCollector import InclusionTreeCollector
 from Collectors.RequestCollector import RequestCollector
 from Collectors.ScreenshotCollector import ScreenshotCollector
 from Collectors.TargetCollector import TargetCollector
+from Helpers.frame_correlator import correlate_and_annotate_events
 from Helpers.hasher import get_folder_name, get_registrable_domain, get_url_hash
 from Helpers.link_extractor import extract_internal_links
 from Helpers.logger import close_logger, get_logger
+from Helpers.schema_validator import SchemaValidationError, validate_result
 
 from timeout_manager import (
     AttemptMetadata,
@@ -77,6 +84,7 @@ STAGE_TIMEOUTS = {
     "APICallCollector": 30.0,          # Storage/API call extraction
     "InclusionTreeCollector": 30.0,    # iframe/script inclusion trees
     "TargetCollector": 30.0,           # Window/target handles
+    "AdDisclosureCollector": 30.0,     # Ad disclosure interaction phase
 }
 DEFAULT_STAGE_TIMEOUT = 15.0
 
@@ -141,7 +149,18 @@ async def _goto_with_fallback(page, url: str, remaining_seconds: float, logger):
     causing networkidle to always stall and waste 10-15s of the timeout budget.
     """
     total_ms = max(5000, int(remaining_seconds * 1000))
-    response = await page.goto(url, timeout=total_ms, wait_until="domcontentloaded")
+    try:
+        response = await page.goto(url, timeout=total_ms, wait_until="domcontentloaded")
+    except Exception as exc:
+        if _is_timeout_error(exc):
+            curr_url = getattr(page, "url", "")
+            if curr_url and curr_url != "about:blank":
+                logger.warning(
+                    f"Navigation DOMContentLoaded timeout ({total_ms}ms) reached, "
+                    f"but page successfully navigated to '{curr_url}'. Continuing with loaded DOM."
+                )
+                return None
+        raise
 
     try:
         await page.wait_for_load_state("load", timeout=3000)
@@ -288,48 +307,27 @@ async def _write_html_snapshot(page, site_dir: Path, logger) -> Path | None:
     if page is None or getattr(page, "is_closed", lambda: True)():
         return None
 
-    # Get frame depth (for bottom-up nesting)
-    def depth(f):
-        d = 0
-        while f.parent_frame:
-            f = f.parent_frame
-            d += 1
-        return d
-
-    # Inline every child iframe's HTML directly into its own <iframe srcdoc="..."> 
-    # Evaluate deepest frames first so we recursively encapsulate tree content!
     try:
-        sorted_frames = sorted(page.frames, key=depth, reverse=True)
-        for frame in sorted_frames[:15]:
-            if frame == page.main_frame or getattr(frame, "is_detached", lambda: False)():
-                continue
-            try:
-                content = await asyncio.wait_for(frame.content(), timeout=1.0)
-                frame_url = getattr(frame, "url", "") or ""
-                network = _infer_ad_network(frame_url, content)
-                
-                handle = await asyncio.wait_for(frame.frame_element(), timeout=1.0)
-                if handle:
-                    await handle.evaluate("""(node, args) => {
-                        node.srcdoc = args.content;
-                        if (args.network) {
-                            node.setAttribute("data-adgraph-network", args.network);
-                        }
-                    }""", {"content": content, "network": network})
-            except Exception as exc:
-                logger.debug(f"Failed to inline frame HTML for {getattr(frame, 'url', 'unknown')}: {exc}")
+        main_html = await asyncio.wait_for(page.content(), timeout=3.0)
     except Exception as exc:
-        logger.debug(f"Failed to process iframe frames for snapshot: {exc}")
-
-    try:
-        main_html = await asyncio.wait_for(page.content(), timeout=2.0)
-    except Exception as exc:
-        logger.debug(f'HTML snapshot skipped: failed to read main page HTML: {exc}')
+        logger.debug(f"HTML snapshot skipped: failed to read main page HTML: {exc}")
         return None
 
+    # Sanitize sensitive values in stored HTML (e.g. passwords, auth tokens, session tokens, sensitive cookies)
+    sanitized_html = re.sub(
+        r'(?i)(session[_-]?token|csrf[_-]?token|auth[_-]?token|bearer\s+[a-z0-9_\-\.]+)\s*[:=]\s*["\']?[a-z0-9_\-\.]+["\']?',
+        r'\1="[REDACTED]"',
+        main_html,
+    )
+    sanitized_html = re.sub(
+        r'(?i)document\.cookie\s*=\s*["\'][^"\']+["\']',
+        'document.cookie="[REDACTED]"',
+        sanitized_html,
+    )
+
     index_path = site_dir / "index.html"
-    index_path.write_text(main_html, encoding="utf-8")
-    logger.info(f"Saved HTML snapshot with inline iframes -> {index_path}")
+    index_path.write_text(sanitized_html, encoding="utf-8")
+    logger.info(f"Saved non-destructive sanitized HTML snapshot -> {index_path}")
     return index_path
 
 
@@ -343,6 +341,8 @@ async def _extract_all_collector_data(
     site_dir: Path,
     final_url: str,
     logger,
+    crawl_context: CrawlContext | None = None,
+    url_hash: str = "",
 ) -> None:
     """Ensure every requested collector extracts and populates its data into result['data']."""
     data = result.setdefault("data", {})
@@ -386,29 +386,26 @@ async def _extract_all_collector_data(
         elif name == CookieCollector.COLLECTOR_NAME:
             if name not in data or not data[name]:
                 try:
-                    if context is not None:
+                    cookie_col = CookieCollector()
+                    cookie_col.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
+                    if page is not None and not getattr(page, "is_closed", lambda: True)():
+                        data[name] = await cookie_col.collect_quick(page)
+                    elif context is not None:
                         raw_cookies = await context.cookies()
-                        cookie_list = []
-                        for c in raw_cookies:
-                            expires_raw = c.get("expires", -1)
-                            is_session = expires_raw == -1 or expires_raw is None
-                            expires_ms = None if is_session else int(expires_raw * 1000)
-                            cookie_list.append({
-                                "name": c.get("name", ""),
-                                "domain": c.get("domain", ""),
-                                "path": c.get("path", "/"),
-                                "expires": expires_ms,
-                                "session": is_session,
-                                "sameSite": c.get("sameSite"),
-                                "httpOnly": c.get("httpOnly", False),
-                                "secure": c.get("secure", False),
-                            })
-                        data[name] = cookie_list
+                        data[name] = [cookie_col._process_cookie(c) for c in raw_cookies]
                     else:
                         data.setdefault(name, [])
                 except Exception as exc:
                     logger.debug(f"[CookieCollector] Cookie extraction error: {exc}")
                     data.setdefault(name, [])
+
+        elif name == AdDisclosureCollector.COLLECTOR_NAME:
+            if name not in data or not data[name]:
+                disc_inst = pre_crawl_instances.get(name)
+                if disc_inst is not None and hasattr(disc_inst, "get_results"):
+                    data[name] = disc_inst.get_results()
+                else:
+                    data.setdefault(name, {"attempts": [], "disclosures": [], "counts": {"detected": 0, "attempted": 0, "opened": 0, "extracted": 0}})
 
         elif name == FingerprintCollector.COLLECTOR_NAME:
             if name not in data or not data[name]:
@@ -472,13 +469,6 @@ async def _extract_all_collector_data(
                 shot_files = list(site_dir.glob("screenshot_*.jpg")) + list(site_dir.glob("screenshot_*.png"))
                 if shot_files:
                     data[name] = [{"screenshot": str(shot_files[0]), "filename": str(shot_files[0].name)}]
-                elif page is not None and not getattr(page, "is_closed", lambda: True)():
-                    try:
-                        shot_col = ScreenshotCollector()
-                        shot_col.init(str(site_dir), logger, url_hash, crawl_context=crawl_context if 'crawl_context' in locals() else None)
-                        data[name] = await shot_col.collect(page)
-                    except Exception:
-                        data.setdefault(name, [])
                 else:
                     data.setdefault(name, [])
 
@@ -489,7 +479,44 @@ async def _extract_all_collector_data(
                     data[name] = inst.get_partial_results()
                 else:
                     data.setdefault(name, [])
+def setup_playwright_exception_handler(loop: asyncio.AbstractEventLoop | None = None):
+    """Filter out benign TargetClosedError noise from Playwright's unawaited background tasks."""
+    if loop is None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
 
+    prev_handler = loop.get_exception_handler()
+
+    def _filter_playwright_errors(current_loop, context):
+        exc = context.get("exception")
+        if exc is not None:
+            text = str(exc)
+            exc_cls = type(exc).__name__
+            if exc_cls in ("TargetClosedError", "Error") or "TargetClosedError" in exc_cls:
+                if any(
+                    token in text
+                    for token in (
+                        "Target page, context or browser has been closed",
+                        "Target closed",
+                        "Session closed",
+                        "Browser has been closed",
+                        "Connection closed",
+                        "Channel.send",
+                    )
+                ):
+                    return
+            if "Channel.send: Target page, context or browser has been closed" in text:
+                return
+
+        if prev_handler:
+            prev_handler(current_loop, context)
+        else:
+            current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_filter_playwright_errors)
+    return prev_handler
 
 
 async def crawl(
@@ -555,7 +582,8 @@ async def crawl(
         "document_id": document_id,
         "initialUrl": url,
         "finalUrl": url,
-        "successful": "false",
+        "successful": False,
+        "status": "initialization",
         "testStarted": int(time.time()),
         "testFinished": None,
         "data": {},
@@ -604,6 +632,7 @@ async def crawl(
     pre_crawl_instances: dict[str, object] = {}
     ad_collector_instance: AdCollector | None = None
     crawler_exc: Exception | None = None
+    prev_handler = setup_playwright_exception_handler()
 
     async with async_playwright() as pw:
         user_data_dir = site_dir / ".pw_profile"
@@ -633,6 +662,7 @@ async def crawl(
         start_time_crawl = time.time()
         try:
             current_stage = "pre_crawl"
+            crawl_context.set_phase(Phase.PAGE_LOAD)
             for name in collector_names:
                 if name == RequestCollector.COLLECTOR_NAME:
                     rc = RequestCollector()
@@ -664,6 +694,22 @@ async def crawl(
                     cookie_popup_col.init(str(site_dir), logger, url_hash, cmp_action=cmp_action)
                     await cookie_popup_col.pre_crawl(page)
                     pre_crawl_instances[name] = cookie_popup_col
+                elif name == CookieCollector.COLLECTOR_NAME:
+                    cookie_col = CookieCollector()
+                    cookie_col.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
+                    await cookie_col.pre_crawl(page)
+                    pre_crawl_instances[name] = cookie_col
+                elif name == AdDisclosureCollector.COLLECTOR_NAME:
+                    disc_col = AdDisclosureCollector()
+                    disc_col.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
+                    await disc_col.pre_crawl(page)
+                    pre_crawl_instances[name] = disc_col
+
+            if AdCollector.COLLECTOR_NAME in collector_names and AdDisclosureCollector.COLLECTOR_NAME not in pre_crawl_instances:
+                disc_col = AdDisclosureCollector()
+                disc_col.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
+                await disc_col.pre_crawl(page)
+                pre_crawl_instances[AdDisclosureCollector.COLLECTOR_NAME] = disc_col
 
             last_completed_stage = "pre_crawl"
             crawl_started = True
@@ -679,21 +725,27 @@ async def crawl(
                 _sg_cdp.on("Network.requestWillBeSent", lambda e: _traffic_mon.handle_request(e))
                 _sg_cdp.on("Network.loadingFinished", lambda e: _traffic_mon.handle_finished(e))
 
-            # --- 1. Page Load: 30-second bounded timeout ---
+            # --- 1. Page Load: Bounded navigation timeout (scales with timeout budget) ---
             current_stage = "navigation"
-            page_timeout_sec = float(timeout) if (timeout and timeout != 30.0 and timeout < 30.0) else PAGE_LOAD_TIMEOUT
+            if timeout and timeout > 0:
+                if float(timeout) <= 30.0:
+                    page_timeout_sec = float(timeout)
+                else:
+                    page_timeout_sec = min(float(timeout) * 0.5, 90.0)
+            else:
+                page_timeout_sec = PAGE_LOAD_TIMEOUT
             response = await _goto_with_fallback(page, url, page_timeout_sec, logger)
             result["finalUrl"] = page.url
             page_loaded = True
             last_completed_stage = "navigation"
 
-            status = response.status if response else "?"
-            logger.info(f"Loaded {page.url}  (HTTP {status})")
+            status_code = response.status if response else "?"
+            logger.info(f"Loaded {page.url}  (HTTP {status_code})")
 
             # Store response status for safeguard engine post-processing
-            if isinstance(status, int):
-                result["_response_status"] = status
-                if status == 429 and response:
+            if isinstance(status_code, int):
+                result["_response_status"] = status_code
+                if status_code == 429 and response:
                     retry_after = response.headers.get("retry-after")
                     if retry_after:
                         result["_retry_after_header"] = retry_after
@@ -717,23 +769,27 @@ async def crawl(
 
             if _check_estop and _check_estop():
                 logger.warning("Emergency stop active — aborting visit")
-                result["successful"] = "false"
+                result["successful"] = False
+                result["status"] = "failed"
                 result["_emergency_stop"] = True
             elif _traffic_mon and _traffic_mon.exceeded:
                 logger.warning(f"Traffic threshold exceeded: {_traffic_mon.exceeded_reason}")
-                result["successful"] = "false"
+                result["successful"] = False
+                result["status"] = "failed"
                 result["_traffic_exceeded"] = True
             elif await _is_blocked(page):
                 logger.warning("Bot-block detected, retrying navigation once")
                 await page.wait_for_timeout(5000)
                 response = await _goto_with_fallback(page, url, page_timeout_sec, logger)
                 result["finalUrl"] = page.url
-                status = response.status if response else "?"
-                logger.info(f"Retry loaded {page.url}  (HTTP {status})")
+                status_code = response.status if response else "?"
+                logger.info(f"Retry loaded {page.url}  (HTTP {status_code})")
 
             last_completed_stage = "post_navigation_checks"
 
-            # --- 4. Collector execution with stage-specific short timeouts ---
+            # --- 4. Passive Ad Delivery Phase ---
+            crawl_context.set_phase(Phase.PASSIVE_AD_DELIVERY)
+
             async def run_collector(name: str):
                 nonlocal ad_collector_instance
                 if name == AdCollector.COLLECTOR_NAME:
@@ -744,6 +800,7 @@ async def crawl(
                         logger,
                         url_hash,
                         max_ads_captured=max_ads,
+                        crawl_context=crawl_context,
                     )
                     return await collector.collect(page)
                 if name == RequestCollector.COLLECTOR_NAME:
@@ -778,11 +835,12 @@ async def crawl(
 
             collectors_started = bool(collector_names)
 
-            # Prioritize ScreenshotCollector if requested so a clean initial page screenshot is saved before heavy ad scraping
-            ordered_collectors = list(collector_names)
+            # Exclude AdDisclosureCollector from passive collection phase (executed in disclosure_interaction phase).
+            # Order ScreenshotCollector last among passive collectors so page screenshot is captured last.
+            ordered_collectors = [c for c in collector_names if c != AdDisclosureCollector.COLLECTOR_NAME]
             if ScreenshotCollector.COLLECTOR_NAME in ordered_collectors:
                 ordered_collectors.remove(ScreenshotCollector.COLLECTOR_NAME)
-                ordered_collectors.insert(0, ScreenshotCollector.COLLECTOR_NAME)
+                ordered_collectors.append(ScreenshotCollector.COLLECTOR_NAME)
 
             for name in ordered_collectors:
                 if _check_estop and _check_estop():
@@ -791,7 +849,7 @@ async def crawl(
                     timeout_stage = "emergency_stop"
                     break
                 if _traffic_mon and _traffic_mon.exceeded:
-                    logger.warning(f"Traffic threshold exceeded — skipping remaining collectors")
+                    logger.warning("Traffic threshold exceeded — skipping remaining collectors")
                     break
                 if _heartbeat_fn:
                     _heartbeat_fn()
@@ -817,7 +875,11 @@ async def crawl(
                         )
                     else:
                         failure_reason = f"{name} error: {col_exc}"
-                        logger.error(f"[{name}] Collector error: {col_exc}")
+                        exc_str = str(col_exc)
+                        if any(pattern in exc_str for pattern in ("Target page", "closed", "Connection closed", "destroyed")):
+                            logger.warning(f"[{name}] Collector interrupted (page/browser closed): {col_exc}")
+                        else:
+                            logger.error(f"[{name}] Collector error: {col_exc}")
 
                     # Extract partial results if available
                     if name == AdCollector.COLLECTOR_NAME and ad_collector_instance is not None:
@@ -828,21 +890,70 @@ async def crawl(
                         if hasattr(inst, "get_partial_results"):
                             result["data"][name] = inst.get_partial_results()
 
+            # --- 5. Disclosure Interaction Phase ---
+            # Perform disclosure interaction only after passive measurements are frozen
+            crawl_context.set_phase(Phase.DISCLOSURE_INTERACTION)
+            if AdDisclosureCollector.COLLECTOR_NAME in collector_names or AdCollector.COLLECTOR_NAME in collector_names:
+                current_stage = AdDisclosureCollector.COLLECTOR_NAME.lower()
+                disc_inst = pre_crawl_instances.get(AdDisclosureCollector.COLLECTOR_NAME)
+                if disc_inst is None:
+                    disc_inst = AdDisclosureCollector()
+                    disc_inst.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
+                    pre_crawl_instances[AdDisclosureCollector.COLLECTOR_NAME] = disc_inst
+
+                ad_data = result["data"].get(AdCollector.COLLECTOR_NAME, {})
+                ad_attrs = ad_data.get("adAttrs", []) if isinstance(ad_data, dict) else []
+                stage_timeout = STAGE_TIMEOUTS.get(AdDisclosureCollector.COLLECTOR_NAME, DEFAULT_STAGE_TIMEOUT)
+
+                try:
+                    disc_result = await asyncio.wait_for(
+                        disc_inst.interact_and_collect_disclosures(page, ad_attrs),
+                        timeout=stage_timeout,
+                    )
+                    result["data"][AdDisclosureCollector.COLLECTOR_NAME] = disc_result
+                    last_completed_stage = current_stage
+                    if AdCollector.COLLECTOR_NAME in collector_names:
+                        ad_inst = pre_crawl_instances.get(AdCollector.COLLECTOR_NAME)
+                        if ad_inst and hasattr(ad_inst, "_scrape_results"):
+                            matched = sum(1 for a in ad_attrs if a.get("adDisclosureText") or a.get("adDisclosurePageUrl"))
+                            ad_inst._scrape_results["nAdDisclosureMatched"] = matched
+                            ad_inst._scrape_results["nAdDisclosureUnmatched"] = max(0, len(ad_attrs) - matched)
+                            ad_inst._scrape_results["nClickedAdChoices"] = sum(1 for a in disc_inst._attempts if a.get("interaction_attempted"))
+                except Exception as disc_exc:
+                    collectors_completed = False
+                    is_to = isinstance(disc_exc, asyncio.TimeoutError) or _is_timeout_error(disc_exc)
+                    if is_to:
+                        had_timeout = True
+                        timeout_stage = current_stage
+                        logger.warning(
+                            f"[AdDisclosureCollector] Collector reached stage timeout ({stage_timeout}s). "
+                            "Saving partial data."
+                        )
+                    else:
+                        failure_reason = f"AdDisclosureCollector error: {disc_exc}"
+                        logger.error(f"[AdDisclosureCollector] Collector error: {disc_exc}")
+
+                    if hasattr(disc_inst, "get_partial_results"):
+                        result["data"][AdDisclosureCollector.COLLECTOR_NAME] = disc_inst.get_partial_results()
+
             # Determine success status and retry policy
             ad_data = result["data"].get(AdCollector.COLLECTOR_NAME, {})
             has_ads = bool(ad_data.get("adAttrs")) if isinstance(ad_data, dict) else bool(ad_data)
             ad_collector_ran = (AdCollector.COLLECTOR_NAME in result["data"]) or (ad_collector_instance is not None)
 
             if page_loaded and collectors_completed and not had_timeout:
-                result["successful"] = "true"
+                result["successful"] = True
+                result["status"] = "completed"
             elif page_loaded and (has_ads or ad_collector_ran):
-                # Page loaded and ad collection ran -> mark as successful or timeout with no-retry
-                result["successful"] = "true" if has_ads else "timeout"
+                result["successful"] = True if (has_ads and not had_timeout) else False
+                result["status"] = "completed" if (has_ads and not had_timeout) else "completed_with_partial_data"
                 result["ad_timeout_no_retry"] = True
             elif had_timeout and (collectors_started or page_loaded):
-                result["successful"] = "timeout"
+                result["successful"] = False
+                result["status"] = "completed_with_partial_data" if has_ads else "timed_out"
             else:
-                result["successful"] = "false"
+                result["successful"] = False
+                result["status"] = "failed"
 
             # Enforce ad_timeout_no_retry if ad collection started/ran or captured data
             _AD_STAGE_NAMES = {"adcollector", AdCollector.COLLECTOR_NAME.lower()}
@@ -854,11 +965,13 @@ async def crawl(
         except Exception as exc:
             crawler_exc = exc
             if _is_timeout_error(exc) and (crawl_started or page_loaded or collectors_started):
-                result["successful"] = "timeout"
+                result["successful"] = False
+                result["status"] = "timed_out"
                 had_timeout = True
                 timeout_stage = current_stage
             else:
-                result["successful"] = "false"
+                result["successful"] = False
+                result["status"] = "failed"
                 failure_reason = str(exc)
             logger.error(f"Crawl error at stage '{current_stage}': {exc}")
 
@@ -902,6 +1015,8 @@ async def crawl(
                     site_dir=site_dir,
                     final_url=result.get("finalUrl", url),
                     logger=logger,
+                    crawl_context=crawl_context,
+                    url_hash=url_hash,
                 )
             except Exception as extract_exc:
                 logger.error(f"Error extracting collector data: {extract_exc}")
@@ -915,34 +1030,74 @@ async def crawl(
                 except Exception:
                     pass
 
-            # Calculate counts
+            # Calculate reconciled counts
             ad_data = result["data"].get(AdCollector.COLLECTOR_NAME, {})
             if isinstance(ad_data, dict):
-                total_ads = len(ad_data.get("adAttrs", []))
-                disclosures_count = len(ad_data.get("unmatchedAdDisclosureContents", []))
+                ad_attrs = ad_data.get("adAttrs", [])
+                total_ads = len(ad_attrs)
+                candidate_ads = ad_data.get("candidateAds", [])
+                if candidate_ads:
+                    n_scraped = len(ad_attrs)
+                    n_small = sum(1 for c in candidate_ads if c.get("candidate_status") == "small")
+                    n_empty = sum(1 for c in candidate_ads if c.get("candidate_status") == "empty")
+                    n_removed = sum(1 for c in candidate_ads if c.get("candidate_status") == "removed")
+                    n_skipped = sum(1 for c in candidate_ads if c.get("candidate_status") == "skipped")
+                    n_timed_out = sum(1 for c in candidate_ads if c.get("candidate_status") == "timed_out")
+                    n_detected = len(candidate_ads)
+                    ad_data["scrapeResults"] = {
+                        "nDetectedAds": n_detected,
+                        "nAdsScraped": n_scraped,
+                        "nSmallAds": n_small,
+                        "nEmptyAds": n_empty,
+                        "nRemovedAds": n_removed,
+                        "nSkippedAds": n_skipped,
+                        "nTimedOutAds": n_timed_out,
+                    }
             elif isinstance(ad_data, list):
                 total_ads = len(ad_data)
-                disclosures_count = 0
             else:
                 total_ads = 0
+
+            # Disclosures count derived from attempt records
+            disc_data = result["data"].get(AdDisclosureCollector.COLLECTOR_NAME, {})
+            if isinstance(disc_data, dict):
+                disc_counts = disc_data.get("counts", {})
+                disclosures_count = disc_counts.get("extracted", 0)
+            else:
                 disclosures_count = 0
 
             cookies_count = len(result["data"].get(CookieCollector.COLLECTOR_NAME, []))
             requests_count = len(result["data"].get(RequestCollector.COLLECTOR_NAME, []))
-            fingerprints_count = len(result["data"].get(FingerprintCollector.COLLECTOR_NAME, []))
+
+            # Fingerprints count: count actual saved events, report truncated separately
+            fp_data = result["data"].get(FingerprintCollector.COLLECTOR_NAME, {})
+            if isinstance(fp_data, dict):
+                saved_fps = fp_data.get("savedCalls", [])
+                fingerprints_count = len(saved_fps)
+            elif isinstance(fp_data, list):
+                fingerprints_count = len(fp_data)
+            else:
+                fingerprints_count = 0
+
             has_screenshot = bool(result["data"].get(ScreenshotCollector.COLLECTOR_NAME))
 
             # Determine attempt status
             has_some_data = bool(total_ads or requests_count or cookies_count or fingerprints_count or page_loaded)
-            if had_timeout or result.get("successful") == "timeout":
+            if had_timeout:
                 status = "completed_with_partial_data" if has_some_data else "timed_out"
-                result["successful"] = "timeout"
-            elif result.get("successful") == "true":
+                successful = False
+            elif result.get("successful") is True:
                 status = "completed"
+                successful = True
             elif crawler_exc and not has_some_data:
                 status = "failed"
+                successful = False
             else:
                 status = "completed_with_partial_data" if has_some_data else "failed"
+                successful = (status == "completed")
+
+            result["successful"] = successful
+            result["status"] = status
 
             try:
                 _annotate_ad_request_attribution(result)
@@ -951,11 +1106,79 @@ async def crawl(
 
             # Cross-collector frame correlation index
             try:
-                from Helpers.frame_correlator import build_frame_correlation_index
-                result["frame_correlation_index"] = build_frame_correlation_index(result)
+                from Helpers.frame_correlator import correlate_and_annotate_events
+                result["frame_correlation_index"] = correlate_and_annotate_events(result)
             except Exception as frame_exc:
                 logger.debug(f"Frame correlation error: {frame_exc}")
                 result["frame_correlation_index"] = {}
+
+            # Phase transitions record
+            result["phase_transitions"] = getattr(crawl_context, "phase_transitions", [])
+
+            # API-to-request association
+            try:
+                from Helpers.api_request_correlator import correlate_apis_and_requests
+                api_inst = pre_crawl_instances.get(APICallCollector.COLLECTOR_NAME)
+                raw_vals = api_inst.get_raw_values_for_matching() if (api_inst and hasattr(api_inst, "get_raw_values_for_matching")) else None
+                assoc_res = correlate_apis_and_requests(
+                    api_events=result.get("data", {}).get(APICallCollector.COLLECTOR_NAME, {}).get("savedCalls", []),
+                    network_requests=result.get("data", {}).get(RequestCollector.COLLECTOR_NAME, []),
+                    raw_api_values=raw_vals,
+                )
+                result["api_request_associations"] = assoc_res.get("accepted_associations", assoc_res.get("associations", []))
+                result["accepted_associations"] = assoc_res.get("accepted_associations", [])
+                result["rejected_candidate_associations"] = assoc_res.get("rejected_candidate_associations", [])
+                result["api_request_association_summary"] = assoc_res.get("summary", {})
+            except Exception as assoc_exc:
+                logger.debug(f"API-Request correlation error: {assoc_exc}")
+                result["api_request_associations"] = []
+                result["accepted_associations"] = []
+                result["rejected_candidate_associations"] = []
+                result["api_request_association_summary"] = {}
+
+            # Disclosure NLP taxonomy and technical alignment
+            try:
+                from Helpers.disclosure_nlp import process_visit_disclosures
+                disc_nlp_res = process_visit_disclosures(result)
+                result["disclosure_statements"] = disc_nlp_res.get("statements", [])
+                result["disclosure_nlp_alignment"] = disc_nlp_res.get("alignment", {})
+            except Exception as nlp_exc:
+                logger.debug(f"Disclosure NLP processing error: {nlp_exc}")
+                result["disclosure_statements"] = []
+                result["disclosure_nlp_alignment"] = {}
+
+            # Data quality reporting
+            try:
+                from Helpers.data_quality import generate_data_quality_report
+                api_col_data = result.get("data", {}).get(APICallCollector.COLLECTOR_NAME, {})
+                col_sum = api_col_data.get("collectionSummary", {}) if isinstance(api_col_data, dict) else {}
+                result["data_quality_report"] = generate_data_quality_report(
+                    result=result,
+                    api_collector_summary=col_sum,
+                    api_request_associations_summary=result.get("api_request_association_summary"),
+                )
+            except Exception as dq_exc:
+                logger.debug(f"Data quality report error: {dq_exc}")
+                result["data_quality_report"] = {}
+
+            # Clean ephemeral in-memory raw values before saving
+            try:
+                api_inst = pre_crawl_instances.get(APICallCollector.COLLECTOR_NAME)
+                if api_inst and hasattr(api_inst, "clean_in_memory_values"):
+                    api_inst.clean_in_memory_values()
+            except Exception:
+                pass
+
+            # Validate result against schema before final save
+            try:
+                from Helpers.schema_validator import validate_result
+                validate_result(result, raise_on_error=True)
+            except Exception as val_exc:
+                logger.error(f"[SchemaValidator] Schema validation failed: {val_exc}")
+                result["status"] = "failed"
+                result["successful"] = False
+                status = "failed"
+                failure_reason = f"Schema validation failed: {val_exc}"
 
             # Determine if ad-collection timeout -> no retry
             ad_timeout_no_retry = bool(result.get("ad_timeout_no_retry", False))
@@ -996,7 +1219,6 @@ async def crawl(
                 parent_url=parent_url,
                 schema_version=crawl_context.schema_version,
             )
-            result["_attempt_metadata"] = metadata.to_dict()
 
             # Crash-recovery checkpoint: write partial result before final atomic save
             partial_path = site_dir / "_partial_result.json"
@@ -1019,17 +1241,9 @@ async def crawl(
                 except Exception:
                     pass
 
+
             try:
-                # Suppress "Future exception was never retrieved" noise from
-                # Playwright's pending internal operations (disclosure nav,
-                # screenshot retries) that get cancelled on context close.
-                loop = asyncio.get_running_loop()
-                _original_handler = loop.get_exception_handler()
-                loop.set_exception_handler(lambda _loop, ctx: None)
-                try:
-                    await context.close()
-                finally:
-                    loop.set_exception_handler(_original_handler)
+                await context.close()
             except Exception as exc:
                 logger.debug(f"Context close error: {exc}")
 
@@ -1046,4 +1260,9 @@ async def crawl(
         logger.info(f"Done. {total_ads} ad(s) found. Status: {status} -> {site_dir}")
         return result
     finally:
+        if prev_handler is not None:
+            try:
+                asyncio.get_running_loop().set_exception_handler(prev_handler)
+            except RuntimeError:
+                pass
         close_logger(logger)

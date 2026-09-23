@@ -290,8 +290,9 @@ class SafeguardEngine:
             # is far too short.  Use the largest stage timeout + a cleanup buffer.
             from crawler import STAGE_TIMEOUTS
             max_stage = max(STAGE_TIMEOUTS.values()) if STAGE_TIMEOUTS else 120.0
-            grace_period = max_stage + 45.0  # stage ceiling + cleanup/save buffer
+            grace_period = (max_stage + 45.0) if visit_timeout >= 30.0 else 1.0
             hard_timeout = visit_timeout + grace_period
+
 
             try:
                 crawl_result = await asyncio.wait_for(
@@ -469,11 +470,40 @@ class SafeguardEngine:
             # SAVE-BEFORE-RETRY VALIDATION: ensure previous attempt was finalized
             previous_attempt_id = attempt_id
 
+            def _persist_retry_decision(will_retry: bool) -> None:
+                att_dir = Path(crawl_kwargs.get("attempt_info", {}).get("output_folder", ""))
+                if not att_dir.is_dir():
+                    from timeout_manager import get_attempt_dir
+                    att_dir = get_attempt_dir(crawl_kwargs.get("output_dir", "output"), website_folder, attempt, attempt_id)
+                meta_file = att_dir / "attempt_metadata.json"
+                if meta_file.is_file():
+                    try:
+                        from timeout_manager import atomic_write_json
+                        m_data = json.loads(meta_file.read_text(encoding="utf-8"))
+                        m_data["retry_scheduled"] = will_retry
+                        m_data["final_attempt"] = not will_retry
+                        atomic_write_json(meta_file, m_data)
+                    except Exception:
+                        pass
+                res_file = att_dir / "result.json"
+                if res_file.is_file():
+                    try:
+                        from timeout_manager import atomic_write_json
+                        r_data = json.loads(res_file.read_text(encoding="utf-8"))
+                        # Remove stale duplicate _attempt_metadata from result.json
+                        if "_attempt_metadata" in r_data:
+                            r_data.pop("_attempt_metadata", None)
+                            atomic_write_json(res_file, r_data)
+                    except Exception:
+                        pass
+
+
             stop_reason = result.get("safeguard_reason", "")
-            successful = result.get("successful", "false")
+            successful = result.get("successful")
 
             # Do not retry if success
-            if successful == "true":
+            if successful is True or successful == "true":
+                _persist_retry_decision(False)
                 return result
 
             # Do not retry if ad-collection timed out (data already saved)
@@ -490,12 +520,14 @@ class SafeguardEngine:
                     reason_code="AD_COLLECTION_TIMEOUT",
                     attempt_number=attempt, retry_number=retry_num,
                 )
+                _persist_retry_decision(False)
                 return result
 
             # Do not retry if partial ad data was already captured
             ad_data = result.get("data", {}).get("AdCollector", {})
             has_ads = bool(ad_data.get("adAttrs")) if isinstance(ad_data, dict) else bool(ad_data)
             if has_ads:
+                _persist_retry_decision(False)
                 return result
 
             # Do not retry for non-retryable reasons
@@ -507,6 +539,7 @@ class SafeguardEngine:
                     reason_code=stop_reason,
                     attempt_number=attempt, retry_number=retry_num,
                 )
+                _persist_retry_decision(False)
                 return result
 
             # Do not retry if we've hit the limit
@@ -517,20 +550,26 @@ class SafeguardEngine:
                     safeguard="retry_limit", action="retry_limit_reached",
                     attempt_number=attempt, retry_number=retry_num,
                 )
+                _persist_retry_decision(False)
                 return result
 
             # Do not retry if emergency stop, domain stopped, or daily limit
             if self._state.is_emergency_stop_active():
+                _persist_retry_decision(False)
                 return result
             stopped, _ = self._state.is_domain_stopped(domain)
             if stopped:
+                _persist_retry_decision(False)
                 return result
             if self._state.is_daily_limit_reached(domain):
+                _persist_retry_decision(False)
                 return result
             if self._state.is_5xx_limit_reached(domain):
+                _persist_retry_decision(False)
                 return result
 
             # Schedule retry
+            _persist_retry_decision(True)
             self._audit.log_event(
                 EventType.RETRY_SCHEDULED, worker_id=self._worker_id,
                 domain=domain, url=url,

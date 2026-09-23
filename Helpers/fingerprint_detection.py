@@ -2,7 +2,6 @@
 
 import re
 
-
 _VALID_JS_IDENTIFIER_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
 
 
@@ -13,21 +12,26 @@ def fingerprint_detection_script(binding_name: str = "calledAPIEvent") -> str:
 
     script = r"""
 (function() {
-  const MAX_NUM_CALLS_TO_INTERCEPT = 100;
+  const MAX_DETAILED_CALLS_PER_API = 100;
   const STACK_LINE_REGEXP = /(\()?(https?:\/\/[^)]+):[0-9]+:[0-9]+(\))?/;
   const accessCounts = Object.create(null);
+  let totalObserved = 0;
 
-  function getSourceFromStack() {
+  function getSourceAndStack() {
+    let source = 'inline_or_unknown';
+    let fullStack = '';
     try {
-      const stack = String(new Error().stack || '').split('\n');
-      stack.shift();
-      stack.shift();
-      const line = stack[1] || '';
-      const match = line.match(STACK_LINE_REGEXP);
-      return match ? match[2] : 'UNKNOWN_SOURCE';
-    } catch (_) {
-      return 'UNKNOWN_SOURCE';
-    }
+      fullStack = String(new Error().stack || '');
+      const lines = fullStack.split('\n');
+      for (let line of lines) {
+        const match = line.match(STACK_LINE_REGEXP);
+        if (match && match[2]) {
+          source = match[2];
+          break;
+        }
+      }
+    } catch (_) {}
+    return { source, stack: fullStack };
   }
 
   function simplifyValue(value, depth) {
@@ -97,20 +101,33 @@ def fingerprint_detection_script(binding_name: str = "calledAPIEvent") -> str:
         const retVal = origFunc.apply(this, arguments);
         const calledFunc = elementType.name + '.' + funcName;
         accessCounts[calledFunc] = (accessCounts[calledFunc] || 0) + 1;
+        totalObserved++;
         const callCnt = accessCounts[calledFunc];
+        const { source, stack } = getSourceAndStack();
 
-        if (callCnt <= MAX_NUM_CALLS_TO_INTERCEPT) {
+        if (callCnt <= MAX_DETAILED_CALLS_PER_API) {
           emitCall({
             description: calledFunc,
             accessType: 'call',
             args: simplifyValue(Array.from(arguments), 0),
             retVal: simplifyValue(retVal, 0),
-            source: getSourceFromStack(),
+            source: source,
+            stack: stack,
+            capture_status: 'captured',
+            total_observed_count: callCnt,
           });
-        }
-
-        if (callCnt >= MAX_NUM_CALLS_TO_INTERCEPT) {
-          Object.defineProperty(elementType.prototype, funcName, origDesc);
+        } else if (callCnt === MAX_DETAILED_CALLS_PER_API + 1 || callCnt % 1000 === 0) {
+          // Do not flood IPC on every call — record truncation marker and periodic running total count
+          emitCall({
+            description: calledFunc,
+            accessType: 'call',
+            args: null,
+            retVal: null,
+            source: source,
+            stack: null,
+            capture_status: 'truncated',
+            total_observed_count: callCnt,
+          });
         }
 
         return retVal;
@@ -131,20 +148,32 @@ def fingerprint_detection_script(binding_name: str = "calledAPIEvent") -> str:
         ? function() {
             const returnVal = origDesc.get.call(this);
             accessCounts[accessedProp] = (accessCounts[accessedProp] || 0) + 1;
+            totalObserved++;
             const accessCnt = accessCounts[accessedProp];
+            const { source, stack } = getSourceAndStack();
 
-            if (accessCnt <= MAX_NUM_CALLS_TO_INTERCEPT) {
+            if (accessCnt <= MAX_DETAILED_CALLS_PER_API) {
               emitCall({
                 description: accessedProp,
                 accessType: 'get',
-                args: '',
+                args: null,
                 retVal: simplifyValue(returnVal, 0),
-                source: getSourceFromStack(),
+                source: source,
+                stack: stack,
+                capture_status: 'captured',
+                total_observed_count: accessCnt,
               });
-            }
-
-            if (accessCnt >= MAX_NUM_CALLS_TO_INTERCEPT) {
-              Object.defineProperty(elementType.prototype, propertyName, origDesc);
+            } else if (accessCnt === MAX_DETAILED_CALLS_PER_API + 1 || accessCnt % 1000 === 0) {
+              emitCall({
+                description: accessedProp,
+                accessType: 'get',
+                args: null,
+                retVal: null,
+                source: source,
+                stack: null,
+                capture_status: 'truncated',
+                total_observed_count: accessCnt,
+              });
             }
 
             return returnVal;
@@ -154,20 +183,32 @@ def fingerprint_detection_script(binding_name: str = "calledAPIEvent") -> str:
         ? function(value) {
             origDesc.set.call(this, value);
             accessCounts[accessedProp] = (accessCounts[accessedProp] || 0) + 1;
+            totalObserved++;
             const accessCnt = accessCounts[accessedProp];
+            const { source, stack } = getSourceAndStack();
 
-            if (accessCnt <= MAX_NUM_CALLS_TO_INTERCEPT) {
+            if (accessCnt <= MAX_DETAILED_CALLS_PER_API) {
               emitCall({
                 description: accessedProp,
                 accessType: 'set',
                 args: simplifyValue(value, 0),
                 retVal: undefined,
-                source: getSourceFromStack(),
+                source: source,
+                stack: stack,
+                capture_status: 'captured',
+                total_observed_count: accessCnt,
               });
-            }
-
-            if (accessCnt >= MAX_NUM_CALLS_TO_INTERCEPT) {
-              Object.defineProperty(elementType.prototype, propertyName, origDesc);
+            } else if (accessCnt === MAX_DETAILED_CALLS_PER_API + 1 || accessCnt % 1000 === 0) {
+              emitCall({
+                description: accessedProp,
+                accessType: 'set',
+                args: null,
+                retVal: null,
+                source: source,
+                stack: null,
+                capture_status: 'truncated',
+                total_observed_count: accessCnt,
+              });
             }
           }
         : undefined,

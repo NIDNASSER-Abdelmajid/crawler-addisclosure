@@ -14,7 +14,7 @@ class InclusionTreeCollector:
         self._logger = logger
         self._url_hash = url_hash
         self._crawl_context = crawl_context
-        self._builder = InclusionTreeBuilder(logger=logger)
+        self._builder = InclusionTreeBuilder(logger=logger, crawl_context=crawl_context)
         self._ready = False
 
     def _handle_event(self, method: str, params: dict) -> None:

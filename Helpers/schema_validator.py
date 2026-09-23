@@ -5,8 +5,11 @@ v2.0.0 contract:
 - Required top-level keys are present
 - ``schema_version`` equals ``"2.0.0"``
 - ``document_id`` is a valid UUID
+- ``successful`` is a boolean (True/False)
+- ``status`` is an explicit status string
 - Monotonic ``event_seq`` numbers are unique across all collectors
-- Per-event fields (timestamp_ms, first_party) conform to expected types
+- Reconciliation of ad candidates and impressions
+- No broken references across ads, disclosure attempts, and events
 """
 
 from __future__ import annotations
@@ -23,8 +26,17 @@ REQUIRED_TOP_LEVEL_KEYS = {
     "initialUrl",
     "finalUrl",
     "successful",
+    "status",
     "testStarted",
     "data",
+}
+
+VALID_STATUSES = {
+    "completed",
+    "completed_with_partial_data",
+    "timed_out",
+    "failed",
+    "rejected",
 }
 
 
@@ -41,20 +53,7 @@ def validate_result(
     result_or_path: dict[str, Any] | str | Path,
     raise_on_error: bool = False,
 ) -> dict[str, Any]:
-    """Validate a result dictionary or JSON file against the v2.0.0 schema.
-
-    Parameters
-    ----------
-    result_or_path : dict or str or Path
-        The dictionary or path to ``result.json``.
-    raise_on_error : bool
-        If True, raises ``SchemaValidationError`` when invalid.
-
-    Returns
-    -------
-    dict
-        {"valid": bool, "errors": list[str], "event_count": int}
-    """
+    """Validate a result dictionary or JSON file against the v2.0.0 schema."""
     errors: list[str] = []
 
     if isinstance(result_or_path, (str, Path)):
@@ -99,13 +98,23 @@ def validate_result(
         except (ValueError, TypeError, AttributeError):
             errors.append(f"Invalid document_id: '{doc_id}' is not a valid UUID")
 
-    # 4. Data container
+    # 4. Successful boolean check
+    successful = payload.get("successful")
+    if not isinstance(successful, bool):
+        errors.append(f"Expected 'successful' to be boolean True/False, got {repr(successful)} ({type(successful).__name__})")
+
+    # 5. Status string check
+    status = payload.get("status")
+    if not isinstance(status, str) or status not in VALID_STATUSES:
+        errors.append(f"Invalid or missing 'status': expected one of {VALID_STATUSES}, got {repr(status)}")
+
+    # 6. Data container
     data = payload.get("data")
     if not isinstance(data, dict):
         errors.append(f"Expected 'data' to be a dict, got {type(data)}")
         data = {}
 
-    # 5. Monotonic event_seq uniqueness across all collectors
+    # 7. Monotonic event_seq uniqueness across all collectors
     seen_event_seqs: dict[int, str] = {}
     total_events = 0
 
@@ -175,6 +184,71 @@ def validate_result(
         for idx, s in enumerate(shots):
             if isinstance(s, dict):
                 _record_seq(s.get("event_seq"), f"ScreenshotCollector[{idx}]")
+
+    # 8. Ad Candidate Reconciliation & Reference Integrity
+    ad_data = data.get("AdCollector", {})
+
+    retained_ad_ids: set[str] = set()
+    candidate_ids: set[str] = set()
+
+    if isinstance(ad_data, dict):
+        scrape_results = ad_data.get("scrapeResults", {})
+        n_detected = scrape_results.get("nDetectedAds", 0)
+        n_scraped = scrape_results.get("nAdsScraped", 0)
+        n_small = scrape_results.get("nSmallAds", 0)
+        n_empty = scrape_results.get("nEmptyAds", 0)
+        n_removed = scrape_results.get("nRemovedAds", 0)
+        n_skipped = scrape_results.get("nSkippedAds", 0)
+        n_timed_out = scrape_results.get("nTimedOutAds", 0)
+
+        # Count reconciliation: every detected ad candidate outcome must reconcile
+        if n_detected > 0:
+            sum_parts = n_scraped + n_small + n_empty + n_removed + n_skipped + n_timed_out
+            if n_detected != sum_parts:
+                errors.append(
+                    f"Inconsistent ad counts: nDetectedAds ({n_detected}) != "
+                    f"sum of outcomes ({sum_parts}: scraped={n_scraped}, small={n_small}, "
+                    f"empty={n_empty}, removed={n_removed}, skipped={n_skipped}, timed_out={n_timed_out})"
+                )
+
+        # Check candidate records
+        candidate_records = ad_data.get("candidateAds", [])
+        for cand in candidate_records:
+            cid = cand.get("ad_candidate_id")
+            if cid:
+                candidate_ids.add(cid)
+
+        # Check adAttrs
+        ad_attrs = ad_data.get("adAttrs", [])
+        if len(ad_attrs) != n_scraped:
+            errors.append(f"Inconsistent adAttrs length ({len(ad_attrs)}) != nAdsScraped ({n_scraped})")
+
+        for idx, ad in enumerate(ad_attrs):
+            imp_id = ad.get("ad_impression_id")
+            cand_id = ad.get("ad_candidate_id")
+            if not imp_id:
+                errors.append(f"AdCollector.adAttrs[{idx}] missing ad_impression_id")
+            else:
+                retained_ad_ids.add(imp_id)
+
+            if cand_id and candidate_ids and cand_id not in candidate_ids:
+                errors.append(
+                    f"Broken reference: adAttrs[{idx}] candidate_id '{cand_id}' not found in candidateAds"
+                )
+
+    # 9. Disclosure Attempt Reference Integrity
+    disc_data = data.get("AdDisclosureCollector", {})
+    known_disc_attempt_ids: set[str] = set()
+    if isinstance(disc_data, dict):
+        for att in disc_data.get("attempts", []):
+            att_id = att.get("disclosure_attempt_id")
+            if att_id:
+                known_disc_attempt_ids.add(att_id)
+            ad_imp = att.get("ad_impression_id")
+            if ad_imp and retained_ad_ids and ad_imp not in retained_ad_ids:
+                errors.append(
+                    f"Broken reference: disclosure attempt '{att_id}' references unknown ad_impression_id '{ad_imp}'"
+                )
 
     is_valid = len(errors) == 0
     if not is_valid and raise_on_error:

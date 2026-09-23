@@ -4,11 +4,13 @@ import argparse
 import asyncio
 import csv
 from datetime import datetime, timezone
+import json
+from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
-import json
+from urllib.parse import urlparse
 
 from crawler import crawl
 from Helpers.collectors import ALL_CHOICES, ALL_COLLECTORS, resolve_all
@@ -20,15 +22,23 @@ def _normalize_seed_url(raw: str) -> str | None:
     val = raw.strip()
     if not val or val.startswith("#"):
         return None
-    if val.isdigit():
+    val = re.sub(r"\(.*?\)", "", val).strip()
+    if not val:
         return None
-    # If no protocol is specified, prepend https://
+    if " " in val:
+        val = val.split()[0].strip()
+    if val.lower() in {"n/a", "na", "none", "null", "nan", "-", "unknown"}:
+        return None
+    if re.fullmatch(r"^[\d.,%+\-]+$", val) or val.endswith("%"):
+        return None
     if not val.startswith(("http://", "https://")):
-        if "." in val or ":" in val or "/" in val:
-            val = f"https://{val}"
-        else:
+        if not re.search(r"[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}", val):
             return None
-    return val
+        val = f"https://{val}"
+    parsed = urlparse(val)
+    if parsed.netloc and "." in parsed.netloc:
+        return val
+    return None
 
 
 def _load_urls_from_file(path: Path) -> list[str]:
@@ -50,22 +60,39 @@ def _load_urls_from_file(path: Path) -> list[str]:
         url_col_candidates = ["finalurl", "url", "target_url", "inputdomain", "domain", "website", "site", "host", "hostname"]
         
         chosen_col_idx: int | None = None
+        # 1. Exact match against candidate list
         for cand in url_col_candidates:
             if cand in header:
                 chosen_col_idx = header.index(cand)
                 break
 
-        has_header = chosen_col_idx is not None or any(c in header for c in ["index", "id", "rank", "category", "statuscode", "adstxt"])
+        # 2. Substring/token match in header (e.g. "source_domain_provider" containing "domain")
+        if chosen_col_idx is None:
+            negative_tokens = {"count", "pct", "percent", "share", "meaning", "text", "desc", "id", "len", "length"}
+            for cand in ["domain", "url", "website", "site", "host"]:
+                for idx, h in enumerate(header):
+                    tokens = set(re.split(r"[_\s\-]+", h))
+                    if cand in tokens or any(cand in t for t in tokens):
+                        if not (tokens & negative_tokens):
+                            chosen_col_idx = idx
+                            break
+                if chosen_col_idx is not None:
+                    break
+
+        has_header = chosen_col_idx is not None or any(c in header for c in ["index", "id", "rank", "category", "statuscode", "adstxt", "dimension"])
         data_rows = rows[1:] if has_header else rows
 
+        # 3. Fallback: inspect data rows for column with highest number of valid normalized URLs
         if chosen_col_idx is None:
+            best_col = 0
+            best_valid_count = 0
             for col_idx in range(len(rows[0])):
-                sample_col_vals = [r[col_idx].strip() for r in data_rows[:10] if len(r) > col_idx]
-                if any("." in v and not v.isdigit() for v in sample_col_vals):
-                    chosen_col_idx = col_idx
-                    break
-            if chosen_col_idx is None:
-                chosen_col_idx = 0
+                sample_vals = [r[col_idx].strip() for r in data_rows[:20] if len(r) > col_idx]
+                valid_count = sum(1 for v in sample_vals if _normalize_seed_url(v) is not None)
+                if valid_count > best_valid_count:
+                    best_valid_count = valid_count
+                    best_col = col_idx
+            chosen_col_idx = best_col
 
         alt_col_idx: int | None = None
         if has_header:
@@ -74,6 +101,7 @@ def _load_urls_from_file(path: Path) -> list[str]:
                     alt_col_idx = header.index(cand)
                     break
 
+        seen: set[str] = set()
         for row in data_rows:
             if not row or len(row) <= chosen_col_idx:
                 continue
@@ -82,14 +110,17 @@ def _load_urls_from_file(path: Path) -> list[str]:
                 raw_val = row[alt_col_idx].strip()
             
             norm_url = _normalize_seed_url(raw_val)
-            if norm_url:
+            if norm_url and norm_url not in seen:
+                seen.add(norm_url)
                 urls.append(norm_url)
         return urls
 
     urls = []
+    seen = set()
     for ln in lines:
         norm_url = _normalize_seed_url(ln)
-        if norm_url:
+        if norm_url and norm_url not in seen:
+            seen.add(norm_url)
             urls.append(norm_url)
     return urls
 
@@ -143,6 +174,8 @@ async def _run_all(
     depth: tuple[int, int] | list[int] | None = None,
 ) -> None:
     crawl_id = f"crawl_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    from crawler import setup_playwright_exception_handler
+    setup_playwright_exception_handler()
 
     from timeout_manager import is_url_already_completed, recover_incomplete_attempts
     recovered = recover_incomplete_attempts(output_dir)
@@ -213,8 +246,15 @@ async def _run_all(
         return await crawl(url, **crawl_kwargs)
 
     def _result_tag(result: dict) -> str:
-        status = result.get("successful", "false")
-        return "OK" if status == "true" else "TIMEOUT" if status == "timeout" else "SKIP" if status == "rejected" else "ERR"
+        success = result.get("successful")
+        if success is True or success == "true":
+            return "OK"
+        status = result.get("status")
+        if status == "timed_out":
+            return "TIMEOUT"
+        if status == "rejected":
+            return "SKIP"
+        return "ERR"
 
     def _result_ads(result: dict) -> int:
         ad_data = result.get("data", {}).get("AdCollector", [])
@@ -355,6 +395,10 @@ async def _run_all(
 
             async def _crawl_one_in_layer(url: str, depth_lvl: int, parent: str | None, seed_idx: int, root_url: str) -> None:
                 nonlocal completed
+                # Stagger initial concurrent worker spin-up to prevent simultaneous network & DNS spikes
+                if num_workers > 1 and seed_idx < num_workers:
+                    await asyncio.sleep(seed_idx * 0.75)
+
                 async with semaphore:
                     try:
                         result = await _crawl_single(
@@ -450,16 +494,24 @@ def main() -> None:
 
     parser.add_argument(
         "-d",
+        "--collectors",
+        "--data-collectors",
         dest="collectors",
         metavar="COLLECTOR",
         nargs="+",
-        default=["ads"],
+        default=None,
         help=(
             "Data collector(s) to run. You may use commas or spaces as separators. "
-            "Short names: ads, cookies, cookiepopup, cookiepopups, requests, screenshot, cmp, api, apis, apicall, apicalls, fingerprint, fingerprints, target, targets, inclusiontree. "
+            "Short names: ads, cookies, cookiepopup, cookiepopups, requests, screenshot, cmp, cmps, api, apis, apicall, apicalls, fingerprint, fingerprints, target, targets, inclusiontree, disclosure, disclosures. "
             f"Full names: {', '.join(ALL_COLLECTORS)}. "
             "Default: ads."
         ),
+    )
+    parser.add_argument(
+        "positional_collectors",
+        nargs="*",
+        default=[],
+        help="Optional positional collector(s) if -d/--collectors flag is omitted.",
     )
     parser.add_argument(
         "--timeout",
@@ -638,8 +690,16 @@ def main() -> None:
             parser.error("--depth arguments must both be non-negative integers (>= 0)")
         depth_config = (max_depth, max_links)
 
+    raw_collectors: list[str] = []
+    if args.collectors:
+        raw_collectors.extend(args.collectors)
+    if args.positional_collectors:
+        raw_collectors.extend(args.positional_collectors)
+    if not raw_collectors:
+        raw_collectors = ["ads"]
+
     split_collectors: list[str] = []
-    for token in args.collectors:
+    for token in raw_collectors:
         split_collectors.extend([c for c in token.split(",") if c])
     args.collectors = resolve_all(split_collectors)
 

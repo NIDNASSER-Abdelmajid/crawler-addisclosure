@@ -378,8 +378,9 @@ def test_recover_incomplete_attempts(temp_output_dir):
     assert len(recovered) == 1
     assert str(att_dir) in recovered
 
-    # Verify .completed marker was created and metadata marked recovered
-    assert (att_dir / ".completed").is_file()
+    # Verify .recovered_partial marker was created (never .completed) and metadata marked recovered
+    assert (att_dir / ".recovered_partial").is_file()
+    assert not (att_dir / ".completed").is_file()
     recovered_meta = json.loads((att_dir / "attempt_metadata.json").read_text(encoding="utf-8"))
     assert recovered_meta["status"] == "recovered_partial"
     assert recovered_meta["partial_data"] is True

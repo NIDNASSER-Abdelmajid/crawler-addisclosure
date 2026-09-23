@@ -11,8 +11,13 @@ Output
 screenshot_<hash>.jpg   Full-page JPEG (quality 75)
 """
 
+import asyncio
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+# Prevent Playwright from hanging indefinitely on unresolved web fonts
+os.environ["PW_TEST_SCREENSHOT_NO_FONTS_READY"] = "1"
 
 from playwright.async_api import Page
 
@@ -30,67 +35,70 @@ class ScreenshotCollector:
         self._crawl_context = crawl_context
 
     async def collect(self, page: Page) -> list:
-        screenshot_path = self._output_dir / f"screenshot_{self._url_hash}.jpg"
-        try:
-            # Removed scrollTo(0, 0) to maintain consistency with AdCollector position
-            # await page.evaluate("window.scrollTo(0, 0)")
-            await page.wait_for_timeout(300)
+        if page is None or getattr(page, "is_closed", lambda: True)():
+            self._logger.warning("[ScreenshotCollector] Page is already closed; skipping screenshot")
+            return []
 
-            await page.screenshot(
-                path=str(screenshot_path),
-                full_page=True,
-                type="jpeg",
-                quality=75,
+        screenshot_path = self._output_dir / f"screenshot_{self._url_hash}.jpg"
+        is_safe_for_full_page = True
+
+        # Check page width before full-page capture.
+        # Chromium's Skia crashes (SkBitmap::tryAllocPixels) if width exceeds safe allocation limits (e.g. 600,000px on knowledgekids.ca).
+        max_safe_w = 8192
+        try:
+            scroll_w = await asyncio.wait_for(
+                page.evaluate("() => (document.documentElement ? document.documentElement.scrollWidth : window.innerWidth) || 1280"),
+                timeout=2.0,
             )
-            self._logger.info(
-                f"[ScreenshotCollector] Full-page screenshot → {screenshot_path}"
-            )
-        except Exception as exc:
-            self._logger.warning(f"[ScreenshotCollector] Full-page screenshot failed: {exc}")
-            try:
-                dims = await page.evaluate(
-                    """
-                    () => {
-                        const de = document.documentElement || {};
-                        const body = document.body || {};
-                        const width = Math.max(
-                            Number(window.innerWidth) || 0,
-                            Number(de.clientWidth) || 0,
-                            Number(body.clientWidth) || 0,
-                            1280
-                        );
-                        const height = Math.max(
-                            Number(window.innerHeight) || 0,
-                            Number(de.clientHeight) || 0,
-                            Number(body.clientHeight) || 0,
-                            720
-                        );
-                        return {
-                            width: Math.max(320, Math.min(3840, Math.floor(width))),
-                            height: Math.max(240, Math.min(3840, Math.floor(height))),
-                        };
-                    }
-                    """
+            if int(scroll_w) > max_safe_w:
+                is_safe_for_full_page = False
+                self._logger.warning(
+                    f"[ScreenshotCollector] Page width ({scroll_w}px) exceeds safe limit ({max_safe_w}px); using safe viewport fallback"
                 )
-                await page.set_viewport_size({
-                    "width": int(dims.get("width", 1280)),
-                    "height": int(dims.get("height", 720)),
-                })
+        except Exception:
+            if getattr(page, "is_closed", lambda: True)():
+                self._logger.warning("[ScreenshotCollector] Target page closed before screenshot")
+                return []
+
+        if is_safe_for_full_page:
+            try:
                 await page.wait_for_timeout(200)
+                await page.screenshot(
+                    path=str(screenshot_path),
+                    full_page=True,
+                    type="jpeg",
+                    quality=75,
+                    timeout=15000,
+                )
+                self._logger.info(
+                    f"[ScreenshotCollector] Full-page screenshot → {screenshot_path}"
+                )
+            except Exception as exc:
+                self._logger.warning(f"[ScreenshotCollector] Full-page screenshot failed: {exc}")
+
+        if not screenshot_path.exists():
+            if getattr(page, "is_closed", lambda: True)():
+                self._logger.warning("[ScreenshotCollector] Target page closed; skipping viewport fallback")
+                return []
+
+            try:
+                await page.wait_for_timeout(100)
+                # Capture current viewport directly without resizing window to prevent layout reflow freezes
                 await page.screenshot(
                     path=str(screenshot_path),
                     full_page=False,
                     type="jpeg",
                     quality=75,
+                    timeout=8000,
                 )
                 self._logger.info(
                     f"[ScreenshotCollector] Viewport fallback screenshot → {screenshot_path}"
                 )
             except Exception as fallback_exc:
-                self._logger.error(f"[ScreenshotCollector] Screenshot fallback failed: {fallback_exc}")
+                self._logger.warning(f"[ScreenshotCollector] Screenshot fallback timed out / skipped: {fallback_exc}")
                 screenshot_path = None
 
-        if not screenshot_path:
+        if not screenshot_path or not screenshot_path.exists():
             return []
 
         event_seq = self._crawl_context.event_counter.next() if self._crawl_context else None

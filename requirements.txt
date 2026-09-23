@@ -1,5 +1,6 @@
 # AdGraph Crawler dependencies
 playwright>=1.44.0        # async browser automation (Chromium included via `playwright install`)
+playwright-stealth>=2.0.0  # anti-bot detection evasion for crawler
 flask>=2.0
 requests>=2.0
 tldextract>=5.0           # registrable domain extraction for ethical safeguards

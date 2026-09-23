@@ -38,7 +38,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Full EasyList URL -- the complete rule set, not just the general-hide subset
-EASYLIST_URL = "https://easylist.to/easylist/easylist.txt"
+EASYLIST_URL = "https://raw.githubusercontent.com/easylist/easylist/refs/heads/master/easylist/easylist_general_hide.txt"
 
 _RESOURCES_DIR = Path(__file__).parent.parent / "resources"
 _SELECTORS_FILE = _RESOURCES_DIR / "easylist_selectors.json"

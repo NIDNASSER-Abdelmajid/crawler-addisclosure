@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
 
-from .breakpoint_script_template import BREAKPOINT_SCRIPT_TEMPLATE
+from .breakpoint_script_template import BREAKPOINT_SCRIPT_TEMPLATE, WRAPPER_INIT_SCRIPT
 
 MAX_ASYNC_CALL_STACK_DEPTH = 32
 HTTP_URL_REGEX = re.compile(r"^https?://", re.IGNORECASE)
@@ -109,7 +109,12 @@ class TrackerTracker:
         description: str,
     ) -> str:
         save_arguments = bool(breakpoint.get("saveArguments"))
-        argument_collection = "args: Array.from(arguments).map(a => a.toString())" if save_arguments else ""
+        argument_collection = (
+            "try { capturedArgs = Array.from(arguments).slice(0, 10).map(a => String(a).slice(0, 500)); } "
+            "catch (_) { capturedArgs = ['<unserializable>']; }"
+            if save_arguments
+            else ""
+        )
 
         script = (
             self._breakpoint_template
@@ -184,6 +189,14 @@ class TrackerTracker:
             self._log("[APICallCollector] setting breakpoint failed: %s %s", description, error)
 
     async def setup_context_tracking(self, context_id: int | None = None) -> None:
+        try:
+            eval_payload: dict[str, Any] = {"expression": WRAPPER_INIT_SCRIPT, "silent": True}
+            if context_id is not None:
+                eval_payload["contextId"] = context_id
+            await self._send("Runtime.evaluate", eval_payload)
+        except Exception as exc:
+            self._log("[APICallCollector] wrapper init script failed: %s", exc)
+
         for group in self._all_breakpoints:
             proto = group.get("proto")
             obj = group.get("global") or (f"{proto}.prototype" if proto else None)
@@ -197,7 +210,21 @@ class TrackerTracker:
                 accessor = "set" if prop.get("setter") is True else "get"
                 expression = f"Reflect.getOwnPropertyDescriptor({obj}, '{name}').{accessor}"
                 description = prop.get("description") or f"{obj}.{name}"
-                await self._add_breakpoint(context_id, expression, description, prop)
+                enriched_prop = dict(prop)
+                enriched_prop["operation_type"] = "property_set" if prop.get("setter") is True else "property_get"
+                
+                # Install non-destructive getter wrapper if getter
+                if accessor == "get":
+                    try:
+                        wrap_expr = f"if (typeof window.__adgraph_wrap_getter__ === 'function') window.__adgraph_wrap_getter__('{obj}', '{name}', '{description}');"
+                        wrap_payload: dict[str, Any] = {"expression": wrap_expr, "silent": True}
+                        if context_id is not None:
+                            wrap_payload["contextId"] = context_id
+                        await self._send("Runtime.evaluate", wrap_payload)
+                    except Exception:
+                        pass
+
+                await self._add_breakpoint(context_id, expression, description, enriched_prop)
 
             for method in group.get("methods", []):
                 name = method.get("name")
@@ -205,7 +232,20 @@ class TrackerTracker:
                     continue
                 expression = f"Reflect.getOwnPropertyDescriptor({obj}, '{name}').value"
                 description = method.get("description") or f"{obj}.{name}"
-                await self._add_breakpoint(context_id, expression, description, method)
+                enriched_method = dict(method)
+                enriched_method["operation_type"] = "method_call"
+
+                # Install non-destructive method wrapper
+                try:
+                    wrap_expr = f"if (typeof window.__adgraph_wrap_method__ === 'function') window.__adgraph_wrap_method__('{obj}', '{name}', '{description}');"
+                    wrap_payload: dict[str, Any] = {"expression": wrap_expr, "silent": True}
+                    if context_id is not None:
+                        wrap_payload["contextId"] = context_id
+                    await self._send("Runtime.evaluate", wrap_payload)
+                except Exception:
+                    pass
+
+                await self._add_breakpoint(context_id, expression, description, enriched_method)
 
     def _get_script_url_from_stack_trace(self, params: dict[str, Any] | None) -> str | None:
         if not isinstance(params, dict):
@@ -217,7 +257,7 @@ class TrackerTracker:
             file_url = self._script_id_to_url.get(str(script_id)) if script_id is not None else None
             frame_url = frame.get("url")
             for candidate in (frame_url, file_url):
-                if candidate and candidate != self._main_url and HTTP_URL_REGEX.match(candidate):
+                if candidate and HTTP_URL_REGEX.match(candidate):
                     return candidate
 
         parent = params.get("parent")
@@ -226,18 +266,18 @@ class TrackerTracker:
         return None
 
     def _normalize_source_url(self, script: str | None) -> str:
-        if not script:
-            if self._main_url:
-                self._log("[APICallCollector] unknown source, assuming main URL")
-            return self._main_url
+        """Normalize source URL without replacing unknown source scripts with publisher URL."""
+        if not script or script.strip() == "":
+            return "<unknown>"
 
         try:
-            script = urljoin(self._main_url, script)
+            if script.startswith(("http://", "https://")):
+                return script
+            if self._main_url and self._main_url.startswith(("http://", "https://")):
+                return urljoin(self._main_url, script)
+            return script
         except Exception:
-            self._log("[APICallCollector] invalid source, assuming main URL", script)
-            script = self._main_url
-
-        return script or self._main_url
+            return "<unknown>"
 
     def _get_script_url_from_paused_event(self, params: dict[str, Any]) -> str:
         script = None
@@ -255,7 +295,7 @@ class TrackerTracker:
             function_url = self._script_id_to_url.get(str(function_script_id)) if function_script_id is not None else None
 
             for candidate in (frame_url, function_url, location_url):
-                if candidate and candidate != self._main_url and HTTP_URL_REGEX.match(candidate):
+                if candidate and HTTP_URL_REGEX.match(candidate):
                     script = candidate
                     break
             if script:
@@ -276,10 +316,18 @@ class TrackerTracker:
 
         script_id_str = str(script_id)
         if script_id_str in self._script_id_to_url:
-            self._log("[APICallCollector] duplicate scriptId", script_id_str)
+            self._log("[APICallCollector] duplicate scriptId: %s", script_id_str)
 
         embedder_name = params.get("embedderName") or params.get("url") or ""
         self._script_id_to_url[script_id_str] = str(embedder_name)
+
+    def get_script_id_for_url(self, url: str | None) -> str | None:
+        if not url:
+            return None
+        for sid, surl in self._script_id_to_url.items():
+            if surl and (surl == url or surl in url or url in surl):
+                return sid
+        return None
 
     @staticmethod
     def _normalize_call_arguments(value: Any) -> list[str]:
@@ -294,7 +342,7 @@ class TrackerTracker:
         try:
             payload = json.loads(payload_raw)
         except Exception:
-            self._log("[APICallCollector] invalid breakpoint payload", payload_raw)
+            self._log("[APICallCollector] invalid breakpoint payload: %s", payload_raw)
             return None
 
         description = payload.get("description")
@@ -303,45 +351,77 @@ class TrackerTracker:
 
         breakpoint = self._get_breakpoint_by_description(description)
         if not breakpoint:
-            self._log("[APICallCollector] unknown breakpoint description", description)
-            return None
+            breakpoint = {"description": description, "saveArguments": False, "operation_type": "unknown"}
 
-        args = self._normalize_call_arguments(payload.get("args"))
+        args = payload.get("args")
         source_url = payload.get("url")
+        stack = payload.get("stack")
 
-        if not source_url:
-            if breakpoint.get("saveArguments"):
-                breakpoint_id = breakpoint.get("cdpId")
-                if breakpoint_id:
-                    self._pending_calls[str(breakpoint_id)] = {
-                        "arguments": args,
-                        "source": None,
-                        "description": description,
-                    }
-            return None
+        # If source_url is missing, recover first HTTP/HTTPS script URL from stack trace lines
+        if (not source_url or source_url == "<unknown>") and stack and isinstance(stack, str):
+            for line in stack.split("\n"):
+                m = re.search(r"(?:https?://[^)\s:]+)", line)
+                if m:
+                    source_url = m.group(0)
+                    break
+
+        norm_source = self._normalize_source_url(source_url)
+        script_id = self.get_script_id_for_url(source_url) or self.get_script_id_for_url(norm_source)
+        operation_type = payload.get("operation_type") or breakpoint.get("operation_type") or ("property_set" if breakpoint.get("setter") else "method_call")
+        api_name = payload.get("api_name") or description
 
         return {
             "description": description,
-            "source": str(source_url),
-            "saveArguments": bool(breakpoint.get("saveArguments")),
+            "api_name": api_name,
+            "operation_type": operation_type,
+            "source": norm_source,
+            "script_id": script_id,
+            "saveArguments": bool(breakpoint.get("saveArguments") or args is not None),
             "arguments": args,
+            "returnValue": payload.get("returnValue"),
+            "hasReturnValue": bool(payload.get("hasReturnValue")),
+            "isAsync": bool(payload.get("isAsync")),
+            "threw": bool(payload.get("threw")),
+            "capture_mechanism": payload.get("capture_mechanism", "binding"),
+            "stack": stack,
+            "breakpoint": breakpoint,
         }
 
     def process_debugger_pause(self, params: dict[str, Any]) -> dict[str, Any] | None:
+        call_frames = params.get("callFrames") or []
+        # Detect breakpoint-wrapper collision first:
+        for frame in call_frames[:5]:
+            fn = frame.get("functionName") or ""
+            url = frame.get("url") or ""
+            if "__adgraph" in fn or "__adgraph" in url or fn in {"wrappedGet", "wrappedMethod", "safeStringify"}:
+                self._log("[APICallCollector] breakpoint-wrapper collision detected in frame %s", fn)
+                return {"collision": True, "reason": "breakpoint_wrapper_collision"}
+
         hit_breakpoints = params.get("hitBreakpoints") or []
         if not hit_breakpoints:
-            return None
+            return {"collision": False, "error": "no_hit_breakpoints"}
 
         breakpoint_id = str(hit_breakpoints[0])
         breakpoint = self._get_breakpoint_by_id(breakpoint_id)
         if not breakpoint:
-            self._log("[APICallCollector] unknown pause breakpoint", hit_breakpoints)
-            return None
+            self._log("[APICallCollector] unknown pause breakpoint: %s", hit_breakpoints)
+            return {"collision": False, "error": "unknown_breakpoint"}
 
         source = self._get_script_url_from_paused_event(params)
+        script_id = None
+        if call_frames:
+            loc = call_frames[0].get("location") or {}
+            script_id = loc.get("scriptId")
+
+        operation_type = breakpoint.get("operation_type") or ("property_set" if breakpoint.get("setter") else "method_call")
+
         return {
             "id": breakpoint_id,
             "description": breakpoint.get("description"),
+            "api_name": breakpoint.get("description"),
+            "operation_type": operation_type,
             "saveArguments": bool(breakpoint.get("saveArguments")),
             "source": source,
+            "script_id": script_id,
+            "call_frames": call_frames,
         }

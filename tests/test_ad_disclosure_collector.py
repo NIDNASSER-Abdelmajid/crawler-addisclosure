@@ -108,6 +108,7 @@ class FakeDisclosurePage:
     async def screenshot(self, path: str, full_page: bool = False):
         self.screenshot_path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).touch()
 
     async def close(self):
         self.closed = True
@@ -290,6 +291,59 @@ async def _test_mismatched_google_href_rejected() -> None:
         assert disclosure_page.closed is True
 
 
+async def _test_interact_and_collect_indexing_and_caching() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        collector = AdDisclosureCollector()
+        collector.init(tmpdir, FakeLogger(), "testhash")
+
+        disclosure_page = FakeDisclosurePage(
+            url="https://privacy.us.criteo.com/privacy",
+            body_text="Why this ad?\nTargeting reasons",
+            links=[],
+        )
+
+        context = FakeContext(new_page_factory=lambda: disclosure_page)
+        main_page = FakeMainPage(context)
+
+        ads = [
+            {
+                "index": 0,
+                "screenshot": "ad_0_testhash.png",
+                "ad_impression_id": "ad_001",
+                "detectedDisclosureControls": [
+                    {"type": "adchoices_link", "href": "https://privacy.us.criteo.com/privacy"}
+                ],
+            },
+            {
+                "index": 1,
+                "screenshot": "ad_1_testhash.png",
+                "ad_impression_id": "ad_002",
+                "detectedDisclosureControls": [
+                    {"type": "adchoices_link", "href": "https://privacy.us.criteo.com/privacy"}
+                ],
+            },
+        ]
+
+        res = await collector.interact_and_collect_disclosures(main_page, ads)
+        disclosures_dir = Path(tmpdir) / "ad_disclosures"
+
+        # Assert 0-indexed disclosure names
+        assert ads[0]["adDisclosureScreenshot"] == "disclosure_ad_0_testhash.png", (
+            f"Expected ad 0 disclosure to start at 0, got {ads[0].get('adDisclosureScreenshot')}"
+        )
+        assert ads[1]["adDisclosureScreenshot"] == "disclosure_ad_1_testhash.png", (
+            f"Expected ad 1 disclosure to be indexed 1, got {ads[1].get('adDisclosureScreenshot')}"
+        )
+
+        # Assert no double prefix
+        assert not ads[0]["adDisclosureScreenshot"].startswith("disclosure_disclosure_")
+        assert not ads[1]["adDisclosureScreenshot"].startswith("disclosure_disclosure_")
+
+        # Assert both screenshot files exist
+        assert (disclosures_dir / "disclosure_ad_0_testhash.png").is_file()
+        assert (disclosures_dir / "disclosure_ad_1_testhash.png").is_file()
+
+
 async def main() -> None:
     await _test_direct_capture()
     await _test_listener_capture()
@@ -297,6 +351,7 @@ async def main() -> None:
     await _test_strict_click_capture()
     await _test_open_new_tab_capture()
     await _test_mismatched_google_href_rejected()
+    await _test_interact_and_collect_indexing_and_caching()
     print("AdDisclosureCollector smoke test passed")
 
 

@@ -16,7 +16,8 @@ def valid_v2_result():
         "document_id": str(uuid.uuid4()),
         "initialUrl": "https://example.com",
         "finalUrl": "https://example.com/home",
-        "successful": "true",
+        "successful": True,
+        "status": "completed",
         "testStarted": 1700000000,
         "testFinished": 1700000030,
         "data": {

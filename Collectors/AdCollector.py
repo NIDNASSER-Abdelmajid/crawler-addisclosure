@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import re
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -10,6 +11,7 @@ from Collectors.AdDisclosureCollector import AdDisclosureCollector
 from Helpers import utils as pageUtils
 from Helpers.ad_choices_matcher import find_ad_choices_in_screenshot
 from Helpers.ad_disclosure import AD_DISC_LINKS_TO_COLLECT, AD_DISCLOSURE_LINKS
+from Helpers.crawl_context import CrawlContext
 
 
 class AdCollector:
@@ -21,10 +23,24 @@ class AdCollector:
     SCROLL_TIMEOUT_MS = 20_000
     ELEMENT_ACTION_TIMEOUT_MS = 1_000
     EXTRACTION_TIMEOUT_MS = 1_500
-    AD_SCRAPE_TIMEOUT_MS = 10_000
+    AD_SCRAPE_TIMEOUT_MS = 15_000
+    DISCLOSURE_DETECTION_TIMEOUT_MS = 2_000
+    PASSIVE_DISCLOSURE_FRAME_DEPTH = 2
     CONTEXT_SCREENSHOT_MARGIN_PX = 150
     AD_SCREENSHOT_MARGIN_PX = 10
-    _disclosure_host_selectors = [f'a[href*="{h}"]' for h in AD_DISCLOSURE_LINKS] + ['a[href*="whythisad"]', 'a[href*="adchoice"]', 'a#abgl', '#abgl']
+    _disclosure_host_selectors = (
+        [f'a[href*="{h}"]' for h in AD_DISCLOSURE_LINKS]
+        + [
+            'a[href*="whythisad"]',
+            'a[href*="adchoice"]',
+            'a[href*="adinfo"]',
+            'a[href*="aboutourads"]',
+            'a[href*="about-our-ads"]',
+            'a[href*="privacy/adinfo"]',
+            'a#abgl',
+            '#abgl',
+        ]
+    )
     ADCHOICES_SELECTOR = f":is({', '.join(_disclosure_host_selectors)})"
     _ADCHOICES_ICON_HINTS = [
         "adchoice",
@@ -32,6 +48,9 @@ class AdCollector:
         "whythisad",
         "why-this-ad",
         "why this ad",
+        "adinfo",
+        "about-our-ads",
+        "aboutourads",
     ]
     ADCHOICES_ICON_SELECTOR = ":is(" + ", ".join(
         [f'img[src*="{hint}" i]' for hint in _ADCHOICES_ICON_HINTS]
@@ -48,10 +67,27 @@ class AdCollector:
         re.IGNORECASE,
     )
     _ADCHOICE_URL_HINTS = tuple(set(
-        ["whythisad", "adchoice", "adchoices"] + [h.lower() for h in AD_DISCLOSURE_LINKS]
+        [
+            "whythisad",
+            "adchoice",
+            "adchoices",
+            "adinfo",
+            "aboutourads",
+            "about-our-ads",
+        ] + [h.lower() for h in AD_DISCLOSURE_LINKS]
     ))
     _ADCHOICE_TEXT_HINTS = tuple(set(
-        ["why this ad", "adchoice", "adchoices"] + [t.lower() for t in AD_DISC_LINKS_TO_COLLECT]
+        [
+            "why this ad",
+            "why this ad?",
+            "why am i seeing this ad",
+            "adchoice",
+            "adchoices",
+            "about our ads",
+            "about these ads",
+            "ad info",
+            "ad feedback",
+        ] + [t.lower() for t in AD_DISC_LINKS_TO_COLLECT]
     ))
 
     _DEEP_ASSET_JS = """
@@ -147,7 +183,11 @@ class AdCollector:
                         });
                     }
 
-                    if (adChoiceSelector && el.matches && el.matches(adChoiceSelector) && href) {
+                    const elText = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().toLowerCase();
+                    const isDiscText = elText.includes('adchoice') || elText.includes('why this ad') ||
+                                       elText.includes('about our ads') || elText.includes('about these ads') ||
+                                       elText.includes('ad info') || elText.includes('why am i seeing');
+                    if (href && ((adChoiceSelector && el.matches && el.matches(adChoiceSelector)) || isDiscText)) {
                         addUnique('adChoicesLinks', href, href);
                     }
                 }
@@ -596,10 +636,12 @@ class AdCollector:
         logger,
         url_hash: str,
         max_ads_captured: int | None = None,
+        crawl_context: CrawlContext | None = None,
     ) -> None:
         self._output_dir = Path(output_dir)
         self._logger = logger
         self._url_hash = url_hash
+        self._crawl_context = crawl_context
         (self._output_dir / "ad_images").mkdir(parents=True, exist_ok=True)
         (self._output_dir / "ad_videos").mkdir(parents=True, exist_ok=True)
         (self._output_dir / "ad_disclosures").mkdir(parents=True, exist_ok=True)
@@ -607,11 +649,12 @@ class AdCollector:
         self._selectors = load_selectors()
         self._visited_ad_urls: list[str] = []
         self._ad_disclosure_collector = AdDisclosureCollector()
-        self._ad_disclosure_collector.init(str(self._output_dir), self._logger, self._url_hash)
+        self._ad_disclosure_collector.init(str(self._output_dir), self._logger, self._url_hash, crawl_context=self._crawl_context)
         self._ad_disclosures_contents: list[dict] = []
         self._unmatched_ad_disclosure_contents: list[dict] = []
         self._n_clicked_adchoices_links = 0
         self._ad_attrs: list[dict] = []
+        self._candidate_records: list[dict] = []
         if isinstance(max_ads_captured, int) and max_ads_captured > 0:
             self._max_ads_captured = max_ads_captured
         elif isinstance(self.MAX_ADS_PER_PAGE, int) and self.MAX_ADS_PER_PAGE > 0:
@@ -620,6 +663,10 @@ class AdCollector:
             self._max_ads_captured = None
 
         self._detected_ads: list[dict] = []
+        self._cdp = None
+        self._frame_info_cache: dict[int, dict] = {}
+        self._cdp_contexts: dict[int, str] = {}
+        self._cdp_frame_tree: dict = {}
 
         self._scrape_results: dict[str, int] = {}
         self._n_small_ads = 0
@@ -630,27 +677,120 @@ class AdCollector:
         self._n_ad_disclosure_matched = 0
         self._n_ad_disclosure_unmatched = 0
 
+    def _frame_identifier(self, frame=None, url: str = "", cdp_frame_id: str | None = None) -> str:
+        """Resolve a distinguishable frame identifier using real browser identifiers."""
+        if cdp_frame_id:
+            return cdp_frame_id
+        if frame is not None:
+            info = self._frame_info_cache.get(id(frame), {})
+            if info.get("frameId"):
+                return info["frameId"]
+            return f"frame_{id(frame)}"
+        return f"frame_{uuid.uuid4().hex[:8]}"
+
+
     def get_partial_results(self) -> dict:
         """Return partial ad collection results captured before a timeout or interruption."""
+        n_detected = len(self._detected_ads)
+        n_scraped = len(self._ad_attrs)
+        n_small = self._n_small_ads
+        n_empty = self._n_empty_ads
+        n_removed = self._n_removed_ads
+        n_skipped = self._n_skipped_ads
+        n_timed_out = self._n_timed_out_ads
+
+        # If detected ads were cut off by a stage timeout before all candidates could be evaluated,
+        # attribute the unaccounted remaining candidates to timed_out so the totals reconcile.
+        accounted = n_scraped + n_small + n_empty + n_removed + n_skipped + n_timed_out
+        unaccounted = max(0, n_detected - accounted)
+        if unaccounted > 0:
+            n_timed_out += unaccounted
+
+        candidate_records = list(self._candidate_records) if self._candidate_records else []
+        if self._detected_ads and len(candidate_records) < n_detected:
+            scraped_ids = {a.get("id") for a in self._ad_attrs if a.get("id")}
+            scraped_cand_ids = {a.get("ad_candidate_id") for a in self._ad_attrs if a.get("ad_candidate_id")}
+            records = []
+            for idx, ad in enumerate(self._detected_ads):
+                if not ad.get("ad_candidate_id"):
+                    cand_id = (
+                        self._crawl_context.next_candidate_id()
+                        if self._crawl_context
+                        else f"cand_{idx + 1:03d}"
+                    )
+                    ad["ad_candidate_id"] = cand_id
+
+                st = ad.get("_candidate_status")
+                cand_id = ad.get("ad_candidate_id")
+                ad_id = ad.get("id")
+                is_scraped = (
+                    bool(ad.get("ad_impression_id"))
+                    or (cand_id in scraped_cand_ids)
+                    or (ad_id and ad_id in scraped_ids)
+                    or st in ("scraped", "retained")
+                )
+
+                if is_scraped:
+                    status_val = "retained"
+                elif st in ("small", "empty", "removed", "skipped", "timed_out"):
+                    status_val = st
+                else:
+                    status_val = "timed_out"
+                    ad["_candidate_status"] = "timed_out"
+
+                records.append({
+                    "ad_candidate_id": cand_id,
+                    "ad_impression_id": ad.get("ad_impression_id"),
+                    "candidate_status": status_val,
+                    "matchedRule": ad.get("matchedRule"),
+                    "nodeType": ad.get("nodeType"),
+                    "id": ad.get("id"),
+                    "width": ad.get("width"),
+                    "height": ad.get("height"),
+                    "x": ad.get("x"),
+                    "y": ad.get("y"),
+                })
+            candidate_records = records
+            self._candidate_records = candidate_records
+
         return {
             "scrapeResults": {
-                "nDetectedAds": len(self._detected_ads),
-                "nAdsScraped": len(self._ad_attrs),
-                "nSmallAds": self._n_small_ads,
-                "nEmptyAds": self._n_empty_ads,
-                "nRemovedAds": self._n_removed_ads,
-                "nSkippedAds": self._n_skipped_ads,
-                "nTimedOutAds": self._n_timed_out_ads,
+                "nDetectedAds": n_detected,
+                "nAdsScraped": n_scraped,
+                "nSmallAds": n_small,
+                "nEmptyAds": n_empty,
+                "nRemovedAds": n_removed,
+                "nSkippedAds": n_skipped,
+                "nTimedOutAds": n_timed_out,
                 "nAdDisclosureMatched": self._n_ad_disclosure_matched,
                 "nAdDisclosureUnmatched": self._n_ad_disclosure_unmatched,
                 "nClickedAdChoices": self._n_clicked_adchoices_links,
             },
             "adAttrs": list(self._ad_attrs),
+            "candidateAds": list(self._candidate_records),
             "visitedAdUrls": list(self._visited_ad_urls),
             "unmatchedAdDisclosureContents": list(self._unmatched_ad_disclosure_contents),
         }
 
+    async def _init_cdp_frame_tracking(self, page: Page) -> None:
+        try:
+            self._cdp = await page.context.new_cdp_session(page)
+            def _on_ctx(ev: dict) -> None:
+                ctx = ev.get("context", {})
+                c_id = ctx.get("id")
+                f_id = (ctx.get("auxData") or {}).get("frameId")
+                if c_id is not None and f_id:
+                    self._cdp_contexts[c_id] = f_id
+            self._cdp.on("Runtime.executionContextCreated", _on_ctx)
+            await self._cdp.send("Page.enable")
+            await self._cdp.send("Runtime.enable")
+            tree = await self._cdp.send("Page.getFrameTree")
+            self._cdp_frame_tree = tree.get("frameTree", {})
+        except Exception as exc:
+            self._logger.debug(f"[AdCollector] CDP frame tracking init error: {exc}")
+
     async def collect(self, page: Page) -> dict:
+        await self._init_cdp_frame_tracking(page)
         try:
             await self._ad_disclosure_collector.pre_crawl(page)
         except Exception as exc:
@@ -670,21 +810,21 @@ class AdCollector:
             self._logger.debug(
                 f"[AdCollector] Candidate {idx}: {node_tag}{node_id} ({int(ad_item.get('width', 0))}x{int(ad_item.get('height', 0))}) [rule: {rule_str}]"
             )
-        ad_attrs, scrape_results = await self._capture_ads(page, ads)
-        self._ad_attrs = ad_attrs
-        self._scrape_results = scrape_results
+        try:
+            ad_attrs, scrape_results = await self._capture_ads(page, ads)
+            self._ad_attrs = ad_attrs
+            self._scrape_results = scrape_results
 
-        self._ad_disclosures_contents = await self._ad_disclosure_collector.collect(page)
-
-        n_matched, n_unmatched = self._match_adchoice_link(ad_attrs)
-        self._n_ad_disclosure_matched = n_matched
-        self._n_ad_disclosure_unmatched = n_unmatched
-        scrape_results["nAdDisclosureMatched"] = n_matched
-        scrape_results["nAdDisclosureUnmatched"] = n_unmatched
-        scrape_results["nClickedAdChoices"] = self._n_clicked_adchoices_links
-
-        self._logger.info(f"[AdCollector] Captured {len(ad_attrs)} ad screenshot(s)")
-        return self.get_partial_results()
+            # Passive collection complete — disclosures will be interacted with in the dedicated disclosure_interaction phase
+            self._logger.info(f"[AdCollector] Captured {len(ad_attrs)} ad screenshot(s) (passive collection)")
+            return self.get_partial_results()
+        finally:
+            if self._cdp:
+                try:
+                    await self._cdp.detach()
+                except Exception:
+                    pass
+                self._cdp = None
 
     async def _click_any_page_adchoice_fallback(self, page: Page) -> str:
         contexts: list[Page | Frame] = [page, *page.frames]
@@ -703,11 +843,14 @@ class AdCollector:
         handles = await _scan_handles()
 
         if not handles:
+            await page.wait_for_timeout(250)
             handles = await _scan_handles()
 
         for handle in handles:
             try:
                 href = await handle.evaluate("el => el.href")
+                if href and any(domain in href for domain in AD_DISCLOSURE_LINKS):
+                    return href
             except Exception:
                 href = ""
 
@@ -747,8 +890,7 @@ class AdCollector:
         """Match disclosure pages to ads using hostname+path prefix matching.
 
         This avoids the old exact-URL-equality approach which broke when two
-        ads shared the same disclosure host (e.g. adssettings.google.com) but
-        had different query-string parameters.
+        ads shared the same disclosure host but had different query-string parameters.
 
         Each disclosure is assigned to at most one ad, and each ad receives
         at most one disclosure (first-match wins, preventing double-assignment).
@@ -822,21 +964,44 @@ class AdCollector:
             self._logger.warning(f"[AdCollector] Scroll error: {exc}")
 
     async def _find_ads(self, page: Page) -> list:
+        if getattr(page, "is_closed", lambda: True)():
+            self._logger.warning("[AdCollector] Target page closed; skipping ad detection")
+            return []
         try:
             return await page.evaluate(self._FIND_ADS_JS, self._selectors)
         except Exception as exc:
-            self._logger.error(f"[AdCollector] DOM query error: {exc}")
+            err_str = str(exc)
+            if any(pattern in err_str for pattern in ("Target page", "closed", "Connection closed", "destroyed")):
+                self._logger.warning(f"[AdCollector] DOM query skipped (page/browser closed): {exc}")
+            else:
+                self._logger.error(f"[AdCollector] DOM query error: {exc}")
             return []
 
-    async def _capture_context_screenshot(self, page: Page, bbox: dict, index: int) -> tuple[str, dict]:
+    async def _capture_context_screenshot(self, page: Page, bbox: dict, index: int, element_handle: ElementHandle | None = None) -> tuple[str, dict]:
         viewport = await page.evaluate("() => ({ width: window.innerWidth, height: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY })")
 
-        # Convert page coordinates (relative to document) to viewport-relative coordinates
-        # by subtracting the current scroll offset.
-        page_left = bbox["x"] - viewport["scrollX"]
-        page_top = bbox["y"] - viewport["scrollY"]
-        page_right = page_left + bbox["width"]
-        page_bottom = page_top + bbox["height"]
+        # Prefer live viewport coordinates directly from element_handle if available and in-viewport
+        page_left = None
+        page_top = None
+        bbox_w = bbox.get("width", 1)
+        bbox_h = bbox.get("height", 1)
+        if element_handle is not None:
+            try:
+                live_box = await element_handle.bounding_box()
+                if live_box and live_box.get("width", 0) > 0 and live_box.get("height", 0) > 0:
+                    page_left = live_box["x"]
+                    page_top = live_box["y"]
+                    bbox_w = live_box["width"]
+                    bbox_h = live_box["height"]
+            except Exception:
+                pass
+
+        if page_left is None or page_top is None:
+            page_left = bbox["x"] - viewport["scrollX"]
+            page_top = bbox["y"] - viewport["scrollY"]
+
+        page_right = page_left + bbox_w
+        page_bottom = page_top + bbox_h
 
         viewport_left = 0
         viewport_top = 0
@@ -849,11 +1014,28 @@ class AdCollector:
         clip_right = min(viewport_right, int(page_right + 0.9999) + margin)
         clip_bottom = min(viewport_bottom, int(page_bottom + 0.9999) + margin)
 
-        clip_width = max(1, clip_right - clip_left)
-        clip_height = max(1, clip_bottom - clip_top)
+        context_dir = self._output_dir / "ad_context_images"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = context_dir / f"ad_{index}_{self._url_hash}_context.png"
 
-        if clip_width <= 0 or clip_height <= 0:
-            raise ValueError("Context clip is empty or outside the viewport")
+        if clip_right <= clip_left or clip_bottom <= clip_top:
+            # The ad is completely outside the viewport (e.g. an off-screen carousel slide).
+            # Capture the current viewport as fallback context without raising an error.
+            try:
+                await page.screenshot(path=str(screenshot_path), full_page=False, timeout=1500)
+                context_box = {
+                    "x": max(0, min(viewport_right - 1, int(page_left))),
+                    "y": max(0, min(viewport_bottom - 1, int(page_top))),
+                    "width": max(1, int(bbox_w)),
+                    "height": max(1, int(bbox_h)),
+                    "outside_viewport": True,
+                }
+                return screenshot_path.name, context_box
+            except Exception:
+                return "", {}
+
+        clip_width = clip_right - clip_left
+        clip_height = clip_bottom - clip_top
 
         context_box = {
             "x": max(0, int(page_left) - clip_left),
@@ -862,9 +1044,6 @@ class AdCollector:
             "height": max(1, int(page_bottom + 0.9999) - int(page_top)),
         }
 
-        context_dir = self._output_dir / "ad_context_images"
-        context_dir.mkdir(parents=True, exist_ok=True)
-        screenshot_path = context_dir / f"ad_{index}_{self._url_hash}_context.png"
         try:
             await page.screenshot(
                 path=str(screenshot_path),
@@ -874,9 +1053,13 @@ class AdCollector:
                     "width": clip_width,
                     "height": clip_height,
                 },
+                timeout=3000,
             )
         except Exception:
-            await page.screenshot(path=str(screenshot_path), full_page=False)
+            try:
+                await page.screenshot(path=str(screenshot_path), full_page=False, timeout=1500)
+            except Exception:
+                return "", {}
         return screenshot_path.name, context_box
 
     def _sanitize_bbox(self, bbox: dict) -> dict | None:
@@ -923,8 +1106,9 @@ class AdCollector:
                 const viewportW = window.innerWidth;
                 const centerY = bbox.y + bbox.height / 2;
                 const centerX = bbox.x + bbox.width / 2;
-                const maxScrollY = Math.max(0, document.documentElement.scrollHeight - viewportH);
-                const maxScrollX = Math.max(0, document.documentElement.scrollWidth - viewportW);
+                const scrollingEl = document.scrollingElement || document.documentElement || document.body;
+                const maxScrollY = Math.max(0, scrollingEl.scrollHeight - viewportH);
+                const maxScrollX = Math.max(0, scrollingEl.scrollWidth - viewportW);
                 const desiredY = Math.min(maxScrollY, Math.max(0, Math.round(centerY - viewportH / 2)));
                 const targetY = desiredY;
                 const targetX = Math.min(maxScrollX, Math.max(0, Math.round(centerX - viewportW / 2)));
@@ -934,7 +1118,7 @@ class AdCollector:
             bbox,
         )
         # Give the page a brief moment to layout after scrolling.
-        await page.wait_for_timeout(100)
+        await page.wait_for_timeout(50)
 
     async def _viewport_clip_from_bbox(self, page: Page, bbox: dict) -> dict | None:
         """Return a clip rectangle for screenshot based on the current viewport.
@@ -961,8 +1145,10 @@ class AdCollector:
 
             clip_right = min(vp["width"], right)
             clip_bottom = min(vp["height"], bottom)
-            clip_width = max(1, clip_right - clip_x)
-            clip_height = max(1, clip_bottom - clip_y)
+            if clip_right <= clip_x or clip_bottom <= clip_y:
+                return None
+            clip_width = clip_right - clip_x
+            clip_height = clip_bottom - clip_y
             if clip_width < self.MIN_PX_FOR_SCREENSHOT or clip_height < self.MIN_PX_FOR_SCREENSHOT:
                 return None
             return {"x": clip_x, "y": clip_y, "width": clip_width, "height": clip_height}
@@ -976,13 +1162,20 @@ class AdCollector:
     async def _capture_bbox_screenshot(self, page: Page, bbox: dict, index: int, element_handle: ElementHandle | None = None) -> tuple[str, dict]:
         screenshot_path = self._output_dir / "ad_images" / f"ad_{index}_{self._url_hash}.png"
         
-        # We always use exact vertical/horizontal centering logic.
-        # This uniformly avoids elements being obscured by sticky top-headers OR sticky bottom-footers,
-        # without randomly pushing ads out of the viewport.
+        # Center the page to the ad's coordinates.
+        # This uniformly avoids elements being obscured by sticky top-headers OR sticky bottom-footers.
         await self._scroll_bbox_into_view(page, bbox)
-        await page.wait_for_timeout(150)
 
-        # After scrolling, the ad might have moved or resized (especially if it is a sticky element itself).
+        # If the element is inside a nested scroll container (e.g. horizontal carousel)
+        # or still off-screen, bring it into view.
+        if element_handle is not None:
+            try:
+                await element_handle.scroll_into_view_if_needed(timeout=300)
+            except Exception:
+                pass
+
+        # After scrolling, the ad might have moved or resized (especially if it is a sticky element itself
+        # or shifted horizontally in a carousel).
         # Re-calculate bounding box.
         if element_handle is not None:
             try:
@@ -1001,14 +1194,20 @@ class AdCollector:
 
         clip = await self._viewport_clip_from_bbox(page, bbox)
         if clip is None:
+            if element_handle is not None:
+                try:
+                    await element_handle.screenshot(path=str(screenshot_path), timeout=1500)
+                    return screenshot_path.name, bbox
+                except Exception:
+                    pass
             try:
-                await page.screenshot(path=str(screenshot_path), full_page=False)
+                await page.screenshot(path=str(screenshot_path), full_page=False, timeout=1500)
                 self._logger.debug(f"[AdCollector] Used viewport screenshot fallback for ad_{index}")
                 return screenshot_path.name, bbox
             except Exception:
                 raise ValueError("Ad clip could not be mapped into the viewport")
 
-        await page.screenshot(path=str(screenshot_path), clip=clip)
+        await page.screenshot(path=str(screenshot_path), clip=clip, timeout=3000)
 
         return screenshot_path.name, bbox
 
@@ -1083,7 +1282,7 @@ class AdCollector:
         context_screenshot = ""
         context_screenshot_box: dict = {}
         try:
-            context_screenshot, context_screenshot_box = await self._capture_context_screenshot(page, bbox, index)
+            context_screenshot, context_screenshot_box = await self._capture_context_screenshot(page, bbox, index, extraction_target)
         except Exception as exc:
             self._logger.warning(f"[AdCollector] Context screenshot error for ad_{index}: {exc}")
 
@@ -1133,95 +1332,144 @@ class AdCollector:
             "adDisclosureScreenshot": "",
         }
 
-        if extraction_target:
-            try:
-                clicked_link, disclosure = await asyncio.wait_for(
-                    self._click_adchoice_link_in_ad(
-                        ad_links_and_images,
-                        page,
-                        screenshot_name,
-                        element_handle=element_handle,
-                    ),
-                    timeout=15.0,
-                )
-            except Exception:
-                clicked_link, disclosure = "", None
-
-            if not clicked_link:
-                fallback_href = self._pick_adchoice_link(ad_links_and_images)
-                if fallback_href:
-                    try:
-                        fallback_disclosure = await asyncio.wait_for(
-                            self._ad_disclosure_collector.open_disclosure_in_new_tab(
-                                page,
-                                fallback_href,
-                                ad_screenshot_name=screenshot_name,
-                            ),
-                            timeout=12.0,
-                        )
-                    except Exception:
-                        fallback_disclosure = None
-                    clicked_link = fallback_href
-                    if fallback_disclosure and not disclosure:
-                        disclosure = fallback_disclosure
-
-            if not clicked_link:
-                try:
-                    ad_img_file = self._output_dir / "ad_images" / screenshot_name
-                    if extraction_target and ad_img_file.is_file():
-                        element_screenshot = ad_img_file.read_bytes()
-                        coords = await asyncio.wait_for(
-                            find_ad_choices_in_screenshot(element_screenshot, page),
-                            timeout=1.0,
-                        )
-                        if coords:
-                            rel_x, rel_y = coords
-                            self._logger.info(
-                                f"[AdCollector] OpenCV fallback: clicking AdChoices icon "
-                                f"at relative ({rel_x:.1f}, {rel_y:.1f}) for ad_{index}"
-                            )
-                            try:
-                                async with page.expect_popup(timeout=1500) as popup_info:
-                                    await extraction_target.click(position={"x": rel_x, "y": rel_y}, force=True, timeout=1000)
-                                popup_page = await popup_info.value
-                                cv_disclosure = await self._ad_disclosure_collector.capture_disclosure_page(
-                                    popup_page,
-                                    ad_screenshot_name=screenshot_name,
-                                )
-                                if cv_disclosure:
-                                    disclosure = cv_disclosure
-                                    clicked_link = popup_page.url
-                                    self._n_clicked_adchoices_links += 1
-                            except Exception:
-                                cv_disclosures = await self._ad_disclosure_collector.capture_context_disclosures(
-                                    page, ad_screenshot_name=screenshot_name, settle_ms=500
-                                )
-                                if cv_disclosures:
-                                    disclosure = cv_disclosures[0]
-                                    clicked_link = disclosure.get("pageUrl", "")
-                                    self._n_clicked_adchoices_links += 1
-                except Exception as exc:
-                    self._logger.debug(f"[AdCollector] OpenCV fallback error for ad_{index}: {exc}")
-
-            if clicked_link and not clicked_link.startswith("javascript:"):
-                ad_attrs["clickedAdChoiceLink"] = clicked_link
-
-            if disclosure:
-                ad_attrs["adDisclosureOutLinks"] = disclosure.get("adDisclosureOutLinks", [])
-                ad_attrs["adDisclosureText"] = disclosure.get("pageText", "")
-                ad_attrs["adDisclosurePageUrl"] = disclosure.get("pageUrl", "")
-                ad_attrs["adDisclosureScreenshot"] = disclosure.get("screenshot", "")
-                self._ad_disclosures_contents.append(disclosure)
+        # PASSIVE COLLECTION ONLY: do NOT click disclosures during passive ad delivery!
+        # Detect candidate disclosure controls and store descriptors for disclosure_interaction phase.
+        # Budget-capped to avoid eating the per-ad scrape timeout.
+        detected_controls = await self._detect_disclosure_controls_passive(
+            ad_links_and_images, extraction_target, element_handle, page, bbox, index, screenshot_name=screenshot_name,
+        )
+        ad_attrs["detectedDisclosureControls"] = detected_controls
+        ad_attrs["hasDisclosureControl"] = bool(detected_controls)
 
         await self._download_ad_videos(page, ad_attrs, index)
 
         matched_rule = ad_attrs.get("matchedRule", "unknown")
+        node_type = ad_attrs.get("nodeType", "")
+        node_id = ad_attrs.get("id", "") or ""
         self._logger.info(
-            f"[AdCollector] ad_{index}: {ad_attrs['nodeType']}#{ad_attrs['id'] or ''} "
+            f"[AdCollector] ad_{index}: {node_type}#{node_id} "
             f"({int(ad_attrs['width'])}x{int(ad_attrs['height'])}) "
             f"[rule: {matched_rule}]"
         )
         return "scraped", ad_attrs
+
+    async def _detect_disclosure_controls_passive(
+        self,
+        ad_links_and_images: list[dict],
+        extraction_target: ElementHandle | None,
+        element_handle: ElementHandle | None,
+        page: Page,
+        bbox: dict,
+        index: int,
+        screenshot_name: str = "",
+    ) -> list[dict]:
+        """Detect disclosure controls without clicking, capped by DISCLOSURE_DETECTION_TIMEOUT_MS.
+
+        This runs during the passive ad delivery phase. It must be fast so it
+        does not consume the per-ad scrape budget.
+        The actual disclosure tab interaction is deferred to the disclosure_interaction phase.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._detect_disclosure_controls_inner(
+                    ad_links_and_images, extraction_target, element_handle, page, bbox, index, screenshot_name=screenshot_name,
+                ),
+                timeout=self.DISCLOSURE_DETECTION_TIMEOUT_MS / 1000,
+            )
+        except asyncio.TimeoutError:
+            self._logger.debug(
+                f"[AdCollector] Disclosure detection timed out for ad_{index} after {self.DISCLOSURE_DETECTION_TIMEOUT_MS}ms; "
+                "returning partial controls"
+            )
+            return []
+        except Exception as exc:
+            self._logger.debug(f"[AdCollector] Disclosure detection error for ad_{index}: {exc}")
+            return []
+
+    async def _detect_disclosure_controls_inner(
+        self,
+        ad_links_and_images: list[dict],
+        extraction_target: ElementHandle | None,
+        element_handle: ElementHandle | None,
+        page: Page,
+        bbox: dict,
+        index: int,
+        screenshot_name: str = "",
+    ) -> list[dict]:
+        """Inner (uncapped) disclosure control detection logic."""
+        detected_controls: list[dict] = []
+
+        # Phase 1: Fast — scan already-extracted link data (no I/O)
+        for frame_data in ad_links_and_images:
+            for d_link in frame_data.get("_adChoicesLinks", []):
+                if d_link and not any(c.get("href") == d_link for c in detected_controls):
+                    detected_controls.append({"type": "adchoices_link", "href": d_link})
+
+        fallback_href = self._pick_adchoice_link(ad_links_and_images)
+        if fallback_href and not any(c.get("href") == fallback_href for c in detected_controls):
+            detected_controls.append({"type": "fallback_link", "href": fallback_href})
+
+        if detected_controls:
+            return detected_controls
+
+        if not extraction_target:
+            return detected_controls
+
+        # Phase 2: Medium — resolve hrefs from existing handles + shallow frame search
+        try:
+            searched_roots = set()
+            for per_frame in ad_links_and_images:
+                handles = per_frame.get("_adChoicesLinksHandles", [])
+                if not handles:
+                    search_root = per_frame.get("_frameHandle") or element_handle
+                    if search_root is not None and id(search_root) not in searched_roots:
+                        searched_roots.add(id(search_root))
+                        deep_handle = await self._find_adchoice_handle(
+                            search_root, self.PASSIVE_DISCLOSURE_FRAME_DEPTH,
+                        )
+                        if deep_handle is not None:
+                            handles = [deep_handle]
+                for h in handles:
+                    try:
+                        href = await h.evaluate("el => el.href")
+                    except Exception:
+                        href = ""
+                    if not href:
+                        try:
+                            href = await self._extract_adchoice_href_from_handle(h)
+                        except Exception:
+                            href = ""
+                    if href and not any(c.get("href") == href for c in detected_controls):
+                        detected_controls.append({"type": "handle_href", "href": href})
+                if detected_controls:
+                    break
+        except Exception as exc:
+            self._logger.debug(f"[AdCollector] Handle disclosure detection error: {exc}")
+
+        if detected_controls:
+            return detected_controls
+
+        # Phase 3: OpenCV icon matching on the already-captured ad screenshot (no extra page screenshot)
+        try:
+            screenshot_bytes = None
+            if screenshot_name:
+                ad_img_path = self._output_dir / "ad_images" / screenshot_name
+                if ad_img_path.is_file() and ad_img_path.stat().st_size > 0:
+                    screenshot_bytes = ad_img_path.read_bytes()
+
+            if screenshot_bytes:
+                coords = await find_ad_choices_in_screenshot(screenshot_bytes, bbox, page)
+                if coords:
+                    rel_x, rel_y = coords
+                    detected_controls.append({
+                        "type": "opencv_icon",
+                        "coords": [rel_x, rel_y],
+                        "href": None,
+                    })
+        except Exception as exc:
+            self._logger.debug(f"[AdCollector] OpenCV disclosure detection error: {exc}")
+
+        return detected_controls
 
     async def _download_ad_videos(self, page: Page, ad_attrs: dict, index: int) -> None:
         video_dir = self._output_dir / "ad_videos"
@@ -1391,6 +1639,11 @@ class AdCollector:
         n_timed_out_ads = 0
         ads_to_process = ads
 
+        for index, ad in enumerate(ads_to_process):
+            cand_id = self._crawl_context.next_candidate_id() if self._crawl_context else f"cand_{index + 1:03d}"
+            ad["ad_candidate_id"] = cand_id
+            ad["_candidate_status"] = "pending"
+
         # Detection scrolling can leave the page deep down. Ads are processed in
         # ascending Y order, so reset once to top before the loop. This avoids
         # per-ad top jumps while keeping upper-page ad clips reachable.
@@ -1402,6 +1655,8 @@ class AdCollector:
 
         for index, ad in enumerate(ads_to_process):
             if self._max_ads_captured is not None and len(ad_details) >= self._max_ads_captured:
+                for rem_idx in range(index, len(ads_to_process)):
+                    ads_to_process[rem_idx]["_candidate_status"] = "skipped"
                 remaining_ads = len(ads_to_process) - index
                 n_skipped_ads += max(0, remaining_ads)
                 self._n_skipped_ads = n_skipped_ads
@@ -1410,6 +1665,8 @@ class AdCollector:
                 )
                 break
             if page.is_closed():
+                for rem_idx in range(index, len(ads_to_process)):
+                    ads_to_process[rem_idx]["_candidate_status"] = "skipped"
                 remaining_ads = len(ads_to_process) - index
                 n_skipped_ads += remaining_ads
                 self._n_skipped_ads = n_skipped_ads
@@ -1423,19 +1680,28 @@ class AdCollector:
                     timeout=self.AD_SCRAPE_TIMEOUT_MS / 1000,
                 )
                 if status == "scraped" and ad_attrs is not None:
+                    imp_id = self._crawl_context.next_impression_id() if self._crawl_context else f"ad_{len(ad_details) + 1:03d}"
+                    ad_attrs["ad_impression_id"] = imp_id
+                    ad_attrs["ad_candidate_id"] = ad["ad_candidate_id"]
+                    ad["ad_impression_id"] = imp_id
+                    ad["_candidate_status"] = "retained"
                     ad_details.append(ad_attrs)
                     self._ad_attrs = ad_details
                 elif status == "small":
+                    ad["_candidate_status"] = "small"
                     n_small_ads += 1
                     self._n_small_ads = n_small_ads
                 elif status == "empty":
+                    ad["_candidate_status"] = "empty"
                     n_empty_ads += 1
                     self._n_empty_ads = n_empty_ads
                 elif status == "removed":
+                    ad["_candidate_status"] = "removed"
                     n_removed_ads += 1
                     self._n_removed_ads = n_removed_ads
             except Exception as exc:
                 if isinstance(exc, asyncio.TimeoutError) or "Timeout" in type(exc).__name__ or "Timeout" in str(exc):
+                    ad["_candidate_status"] = "timed_out"
                     n_timed_out_ads += 1
                     self._n_timed_out_ads = n_timed_out_ads
                     rule_str = ad.get("matchedRule", "unknown")
@@ -1443,9 +1709,26 @@ class AdCollector:
                         f"[AdCollector] Timed out scraping ad_{index} ({ad.get('nodeType', '')}#{ad.get('id', '')} [rule: {rule_str}]) after {self.AD_SCRAPE_TIMEOUT_MS} ms"
                     )
                     continue
+                ad["_candidate_status"] = "removed"
                 n_removed_ads += 1
                 self._n_removed_ads = n_removed_ads
                 self._logger.warning(f"[AdCollector] Screenshot error for ad_{index}: {exc}")
+
+        self._candidate_records = [
+            {
+                "ad_candidate_id": ad.get("ad_candidate_id"),
+                "ad_impression_id": ad.get("ad_impression_id"),
+                "candidate_status": ad.get("_candidate_status", "retained" if ad.get("ad_impression_id") else "removed"),
+                "matchedRule": ad.get("matchedRule"),
+                "nodeType": ad.get("nodeType"),
+                "id": ad.get("id"),
+                "width": ad.get("width"),
+                "height": ad.get("height"),
+                "x": ad.get("x"),
+                "y": ad.get("y"),
+            }
+            for ad in ads_to_process
+        ]
 
         scrape_results = {
             "nDetectedAds": len(ads),
@@ -1459,10 +1742,76 @@ class AdCollector:
         self._scrape_results = scrape_results
         return ad_details, scrape_results
 
-    def _frame_identifier(self, seed: str) -> str:
-        if not seed:
-            seed = f"frame:{self._url_hash}"
-        return hashlib.md5(seed.encode("utf-8"), usedforsecurity=False).hexdigest().upper()[:24]
+    async def _resolve_browser_frame_info(self, frame_or_handle: Frame | ElementHandle | None, page_url: str) -> dict[str, Any]:
+        if frame_or_handle is None:
+            return {
+                "frameId": None,
+                "loaderId": None,
+                "executionContextId": None,
+                "parentFrameId": None,
+            }
+
+        key = id(frame_or_handle)
+        if key in self._frame_info_cache:
+            return self._frame_info_cache[key]
+
+        frame_id = None
+        loader_id = None
+        exec_ctx_id = None
+        parent_frame_id = None
+
+        if isinstance(frame_or_handle, Frame):
+            parent_frame = frame_or_handle.parent_frame
+            if parent_frame:
+                parent_info = await self._resolve_browser_frame_info(parent_frame, page_url)
+                parent_frame_id = parent_info.get("frameId")
+
+            if hasattr(frame_or_handle, "page") and frame_or_handle == frame_or_handle.page.main_frame:
+                main_frame = self._cdp_frame_tree.get("frame", {}) if isinstance(self._cdp_frame_tree, dict) else {}
+                frame_id = main_frame.get("id")
+                loader_id = main_frame.get("loaderId")
+            else:
+                token = uuid.uuid4().hex
+                if self._cdp:
+                    try:
+                        await frame_or_handle.evaluate(f"() => {{ window.__ag_ftok = '{token}'; }}")
+                        for c_id, f_id in list(self._cdp_contexts.items()):
+                            try:
+                                res = await self._cdp.send("Runtime.evaluate", {
+                                    "expression": "window.__ag_ftok",
+                                    "contextId": c_id,
+                                    "silent": True,
+                                })
+                                if (res.get("result") or {}).get("value") == token:
+                                    exec_ctx_id = c_id
+                                    frame_id = f_id
+                                    break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+            if not frame_id:
+                frame_id = f"cdp_frame_{abs(hash(frame_or_handle))}_{uuid.uuid4().hex[:8]}"
+        else:
+            try:
+                elem_page = getattr(frame_or_handle, "page", None)
+                if elem_page:
+                    main_info = await self._resolve_browser_frame_info(elem_page.main_frame, page_url)
+                    frame_id = main_info.get("frameId")
+                    loader_id = main_info.get("loaderId")
+                    parent_frame_id = None
+            except Exception:
+                frame_id = f"elem_frame_{abs(hash(frame_or_handle))}_{uuid.uuid4().hex[:8]}"
+
+        info = {
+            "frameId": frame_id,
+            "loaderId": loader_id,
+            "executionContextId": exec_ctx_id,
+            "parentFrameId": parent_frame_id,
+        }
+        self._frame_info_cache[key] = info
+        return info
 
     async def _eval_all(self, context: Frame | ElementHandle, selector: str, expression: str):
         try:
@@ -1479,6 +1828,8 @@ class AdCollector:
         parent_frame_url: str,
         parent_frame_id: str | None,
         is_main_document: bool,
+        loader_id: str | None = None,
+        execution_context_id: int | None = None,
     ) -> dict:
         try:
             if isinstance(context, Frame):
@@ -1520,6 +1871,8 @@ class AdCollector:
             "isMainDocument": is_main_document,
             "parentFrameUrl": parent_frame_url,
             "frameId": frame_id,
+            "loaderId": loader_id,
+            "executionContextId": execution_context_id,
             "parentFrameId": parent_frame_id,
             "links": links,
             "imageLinks": image_links,
@@ -1627,14 +1980,20 @@ class AdCollector:
                 }
             )
 
+        main_info = self._cdp_frame_tree.get("frame", {}) if isinstance(self._cdp_frame_tree, dict) else {}
+        main_frame_id = main_info.get("id") or f"main_{uuid.uuid4().hex[:8]}"
+        main_loader_id = main_info.get("loaderId")
+
         return [
             {
                 "frameUrl": page_url,
                 "containsImgsOrLinks": bool(imgs or links or image_links or other_links or adchoices),
                 "isMainDocument": False,
                 "parentFrameUrl": page_url,
-                "frameId": self._frame_identifier(f"{page_url}:ad:{ad_index}"),
-                "parentFrameId": self._frame_identifier(page_url),
+                "frameId": main_frame_id,
+                "loaderId": main_loader_id,
+                "executionContextId": None,
+                "parentFrameId": main_frame_id,
                 "links": links,
                 "imageLinks": image_links,
                 "otherLinks": other_links,
@@ -1653,7 +2012,9 @@ class AdCollector:
                 "containsImgsOrLinks": False,
                 "isMainDocument": True,
                 "parentFrameUrl": "unknown",
-                "frameId": self._frame_identifier(f"main:{page_url}"),
+                "frameId": main_frame_id,
+                "loaderId": main_loader_id,
+                "executionContextId": None,
                 "parentFrameId": None,
                 "links": [],
                 "imageLinks": [],
@@ -1819,13 +2180,16 @@ class AdCollector:
         frame_url = frame.url
         parent_frame = frame.parent_frame
         parent_frame_url = parent_frame.url if parent_frame else "unknown"
-        frame_id = self._frame_identifier(frame_url or page_url)
-        parent_frame_id = self._frame_identifier(parent_frame_url) if parent_frame else None
+        frame_info = await self._resolve_browser_frame_info(frame, page_url)
+        frame_id = frame_info.get("frameId")
+        parent_frame_id = frame_info.get("parentFrameId")
         entries.append(
             await self._extract_context_artifacts(
                 frame,
                 frame_url=frame_url,
                 frame_id=frame_id,
+                loader_id=frame_info.get("loaderId"),
+                execution_context_id=frame_info.get("executionContextId"),
                 parent_frame_url=parent_frame_url,
                 parent_frame_id=parent_frame_id,
                 is_main_document=False,
@@ -1842,23 +2206,34 @@ class AdCollector:
             if frame is not None:
                 entries.extend(await self._walk_frame_assets(frame, page_url, 0))
 
-        root_frame_id = self._frame_identifier(f"{page_url}:ad:{ad_index}")
+        element_info = await self._resolve_browser_frame_info(element_handle, page_url)
+        root_frame_id = element_info.get("frameId") or f"elem_frame_{ad_index}"
+        parent_frame_id = element_info.get("parentFrameId")
         root_entry = await self._extract_context_artifacts(
             element_handle,
             frame_url=page_url,
             frame_id=root_frame_id,
+            loader_id=element_info.get("loaderId"),
+            execution_context_id=element_info.get("executionContextId"),
             parent_frame_url=page_url,
-            parent_frame_id=self._frame_identifier(page_url),
+            parent_frame_id=parent_frame_id,
             is_main_document=False,
         )
         entries.append(root_entry)
+
+        main_info = self._cdp_frame_tree.get("frame", {}) if isinstance(self._cdp_frame_tree, dict) else {}
+        main_frame_id = main_info.get("id") or f"main_{uuid.uuid4().hex[:8]}"
+        main_loader_id = main_info.get("loaderId")
+
         entries.append(
             {
                 "frameUrl": "",
                 "containsImgsOrLinks": False,
                 "isMainDocument": True,
                 "parentFrameUrl": "unknown",
-                "frameId": self._frame_identifier(f"main:{page_url}"),
+                "frameId": main_frame_id,
+                "loaderId": main_loader_id,
+                "executionContextId": None,
                 "parentFrameId": None,
                 "links": [],
                 "imageLinks": [],

@@ -33,8 +33,12 @@ async def main():
             page = context.pages[0] if context.pages else await context.new_page()
             
             try:
-                from playwright_stealth import stealth_async
-                await stealth_async(page)
+                try:
+                    from playwright_stealth import Stealth
+                    await Stealth().apply_stealth_async(page)
+                except (ImportError, AttributeError):
+                    from playwright_stealth import stealth_async
+                    await stealth_async(page)
                 print("Stealth mode applied")
             except Exception as e:
                 pass

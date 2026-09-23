@@ -283,7 +283,7 @@ class AttemptMetadata:
     ad_timeout_no_retry: bool = False  # True when timeout was at/after ad collection
     # Counts
     ads_count: int = 0
-    disclosures_count: int = 0
+    disclosures_count: Any = 0
     cookies_count: int = 0
     requests_count: int = 0
     fingerprints_count: int = 0
@@ -519,13 +519,15 @@ def recover_incomplete_attempts(base_output_dir: Path | str) -> list[str]:
                     meta_data["status"] = "recovered_partial"
                     meta_data["partial_data"] = True
                     atomic_write_json(meta_path, meta_data)
-                    marker.write_text(json.dumps({"recovered_at": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+                    recovered_marker = att_dir / ".recovered_partial"
+                    recovered_marker.write_text(json.dumps({"recovered_at": datetime.now(timezone.utc).isoformat(), "status": "recovered_partial"}), encoding="utf-8")
                     recovered.append(str(att_dir))
                 except Exception:
                     pass
             elif result_path.is_file():
                 try:
-                    marker.write_text(json.dumps({"recovered_raw_result": True}), encoding="utf-8")
+                    recovered_marker = att_dir / ".recovered_partial"
+                    recovered_marker.write_text(json.dumps({"recovered_raw_result": True, "status": "recovered_partial"}), encoding="utf-8")
                     recovered.append(str(att_dir))
                 except Exception:
                     pass

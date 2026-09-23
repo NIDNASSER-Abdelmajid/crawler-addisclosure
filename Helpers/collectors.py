@@ -14,6 +14,7 @@ ALIASES: dict[str, str] = {
     "requests":   "RequestCollector",
     "screenshot": "ScreenshotCollector",
     "cmp":        "CookiePopupsCollector",
+    "cmps":       "CookiePopupsCollector",
     "api":        "APICallCollector",
     "apis":       "APICallCollector",
     "apicall":    "APICallCollector",
@@ -23,6 +24,10 @@ ALIASES: dict[str, str] = {
     "target":      "TargetCollector",
     "targets":     "TargetCollector",
     "inclusiontree": "InclusionTreeCollector",
+    "disclosure":  "AdDisclosureCollector",
+    "disclosures": "AdDisclosureCollector",
+    "addisclosure": "AdDisclosureCollector",
+    "addisclosures": "AdDisclosureCollector",
 }
 
 # Every accepted name (canonical + aliases), for argparse choices validation
@@ -39,6 +44,7 @@ ALL_COLLECTORS: list[str] = [
     "FingerprintCollector",
     "TargetCollector",
     "InclusionTreeCollector",
+    "AdDisclosureCollector",
 ]
 
 
@@ -49,6 +55,8 @@ def resolve(name: str) -> str:
 
 def resolve_all(names: list[str]) -> list[str]:
     """Resolve a list of names (aliases or canonical), deduplicating while preserving order."""
+    if any(n.lower() == "all" for n in names):
+        return list(ALL_COLLECTORS)
     seen: set[str] = set()
     result: list[str] = []
     for n in names:

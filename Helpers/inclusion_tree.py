@@ -1,9 +1,11 @@
 import copy
+from urllib.parse import parse_qs
 
 
 class InclusionTreeBuilder:
-    def __init__(self, logger=None) -> None:
+    def __init__(self, logger=None, crawl_context=None) -> None:
         self._logger = logger
+        self._crawl_context = crawl_context
         self.reset()
 
     def reset(self) -> None:
@@ -109,12 +111,31 @@ class InclusionTreeBuilder:
             }
 
             if header_entry["method"] == "POST" and "postData" in request:
-                header_entry["data"] = request.get("postData")
+                raw_post = str(request.get("postData") or "")
+                param_names: list[str] = []
+                param_hmacs: dict[str, Any] = {}
+                if "=" in raw_post:
+                    try:
+                        parsed = parse_qs(raw_post, keep_blank_values=True)
+                        param_names = sorted(parsed.keys())
+                        if self._crawl_context:
+                            for k, vals in parsed.items():
+                                if len(vals) == 1:
+                                    param_hmacs[k] = self._crawl_context.hmac_value(vals[0])
+                                else:
+                                    param_hmacs[k] = [self._crawl_context.hmac_value(v) for v in vals]
+                    except Exception:
+                        pass
+                header_entry["request_body_metadata"] = {
+                    "byte_length": len(raw_post.encode("utf-8", errors="replace")),
+                    "parameter_names": param_names,
+                    "parameter_hmacs": param_hmacs,
+                }
 
             request_headers = response.get("requestHeaders") or request.get("headers")
             if isinstance(request_headers, dict):
                 header_entry["request"] = {
-                    name: value
+                    name: ("<redacted>" if str(name).lower() in {"cookie", "authorization", "proxy-authorization"} else value)
                     for name, value in request_headers.items()
                     if not str(name).startswith(":")
                 }
@@ -122,7 +143,7 @@ class InclusionTreeBuilder:
             response_headers = response.get("headers")
             if isinstance(response_headers, dict):
                 header_entry["response"] = {
-                    name: value
+                    name: ("<redacted>" if str(name).lower() in {"set-cookie"} else value)
                     for name, value in response_headers.items()
                     if not str(name).startswith(":")
                 }
@@ -164,6 +185,10 @@ class InclusionTreeBuilder:
         inclusion_node = {
             "type": resource_type,
             "url": resource_url,
+            "requestId": str(request_id),
+            "frameId": str(frame_id) if frame_id is not None else None,
+            "loaderId": str(loader_id) if loader_id is not None else None,
+            "initiatorScriptId": str(initiator_script_id) if initiator_script_id is not None else None,
             "headers": resource_headers,
             "children": [],
         }
@@ -333,13 +358,29 @@ class InclusionTreeBuilder:
         if method == "Network.webSocketWillSendHandshakeRequest":
             websocket_state["timestamp"] = params.get("timestamp")
             websocket_state["wallTime"] = params.get("wallTime")
+            req_headers = (params.get("request") or {}).get("headers")
+            sanitized_req = {}
+            if isinstance(req_headers, dict):
+                sanitized_req = {
+                    name: ("<redacted>" if str(name).lower() in {"cookie", "authorization", "proxy-authorization"} else value)
+                    for name, value in req_headers.items()
+                    if not str(name).startswith(":")
+                }
             node["headers"].append({
                 "timestamp": params.get("wallTime"),
-                "request": (params.get("request") or {}).get("headers"),
+                "request": sanitized_req,
             })
         elif method == "Network.webSocketHandshakeResponseReceived":
             if node["headers"]:
-                node["headers"][-1]["response"] = (params.get("response") or {}).get("headers")
+                resp_headers = (params.get("response") or {}).get("headers")
+                sanitized_resp = {}
+                if isinstance(resp_headers, dict):
+                    sanitized_resp = {
+                        name: ("<redacted>" if str(name).lower() in {"set-cookie"} else value)
+                        for name, value in resp_headers.items()
+                        if not str(name).startswith(":")
+                    }
+                node["headers"][-1]["response"] = sanitized_resp
                 response = params.get("response") or {}
                 node["headers"][-1]["status"] = f"{response.get('status', '')} {response.get('statusText', '')}".strip()
         elif method in {"Network.webSocketFrameSent", "Network.webSocketFrameReceived"}:
@@ -347,11 +388,17 @@ class InclusionTreeBuilder:
                 timestamp = None
             else:
                 timestamp = websocket_state["wallTime"] + params.get("timestamp", 0) - websocket_state["timestamp"]
+            resp = params.get("response") or {}
+            payload_str = str(resp.get("payloadData") or "")
+            payload_hmac = self._crawl_context.hmac_value(payload_str) if (self._crawl_context and payload_str) else ""
             payload = {
                 "type": "send" if method == "Network.webSocketFrameSent" else "receive",
                 "timestamp": timestamp,
+                "opcode": resp.get("opcode"),
+                "mask": resp.get("mask"),
+                "byte_length": len(payload_str.encode("utf-8", errors="replace")),
+                "payload_hmac": payload_hmac,
             }
-            payload.update(params.get("response") or {})
             node["data"].append(payload)
         elif method == "Network.webSocketClosed":
             if websocket_state.get("wallTime") is not None and websocket_state.get("timestamp") is not None:
