@@ -119,12 +119,19 @@ def get_website_folder_name(url: str) -> str:
     return slug
 
 
-def get_attempt_folder_name(attempt_number: int, attempt_id: str | None = None) -> str:
-    """Format attempt folder name as attempt_NNN.
-
-    The attempt_id parameter is accepted for backward compatibility but is no
-    longer included in the folder name — only sequential numbering is used.
+def get_attempt_folder_name(
+    attempt_number: int,
+    attempt_id: str | None = None,
+    profile_name: str | None = None,
+) -> str:
+    """Format attempt folder name as attempt_profile_<name> when profile_name is provided,
+    or attempt_NNN otherwise.
     """
+    if profile_name:
+        norm = profile_name.strip().lower()
+        if not norm.startswith("profile_"):
+            norm = f"profile_{norm}"
+        return f"attempt_{norm}"
     return f"attempt_{attempt_number:03d}"
 
 
@@ -138,17 +145,23 @@ def get_attempt_dir(
     website_folder: str,
     attempt_number: int,
     attempt_id: str | None = None,
+    profile_name: str | None = None,
 ) -> Path:
-    """Return <base_output_dir>/<website_folder>/attempt_NNN/ path."""
-    return get_website_dir(base_output_dir, website_folder) / get_attempt_folder_name(attempt_number, attempt_id)
+    """Return <base_output_dir>/<website_folder>/attempt_... path."""
+    return get_website_dir(base_output_dir, website_folder) / get_attempt_folder_name(
+        attempt_number, attempt_id, profile_name=profile_name
+    )
 
 
-def is_url_already_completed(base_output_dir: Path | str, url: str) -> bool:
+def is_url_already_completed(
+    base_output_dir: Path | str,
+    url: str,
+    profile_name: str | None = None,
+) -> bool:
     """Check if a URL has already been crawled and completed in the output directory.
 
-    A URL is considered completed if its website directory exists and has a
-    site_manifest.json with a completed status, or an attempt subfolder with a
-    .completed marker.
+    If profile_name is specified, checks specifically if that profile's attempt completed.
+    Otherwise checks if any attempt completed.
     """
     if not url or not base_output_dir:
         return False
@@ -156,6 +169,19 @@ def is_url_already_completed(base_output_dir: Path | str, url: str) -> bool:
     folder_name = get_website_folder_name(url)
     web_dir = get_website_dir(base_output_dir, folder_name)
     if not web_dir.is_dir():
+        return False
+
+    if profile_name:
+        norm = profile_name.strip().lower()
+        if not norm.startswith("profile_"):
+            norm = f"profile_{norm}"
+        expected_folder = f"attempt_{norm}"
+        prof_attempt_dir = web_dir / expected_folder
+        if prof_attempt_dir.is_dir() and (prof_attempt_dir / ".completed").is_file():
+            return True
+        for child in web_dir.iterdir():
+            if child.is_dir() and child.name.startswith(expected_folder) and (child / ".completed").is_file():
+                return True
         return False
 
     manifest_path = web_dir / WebsiteManifestManager.MANIFEST_FILENAME
@@ -294,6 +320,7 @@ class AttemptMetadata:
     error_type: str = ""
     depth_level: int = 0
     parent_url: Optional[str] = None
+    profile_name: Optional[str] = None
     schema_version: str = "2.0.0"
     result_json_sha256: str = ""
     integrity_status: str = ""
@@ -353,22 +380,27 @@ class WebsiteManifestManager:
             manifest["depth_level"] = metadata.depth_level
             manifest["parent_url"] = metadata.parent_url or metadata.normalized_url
 
-            # Remove existing attempt with same ID if updating
-            attempts = [a for a in manifest["attempts"] if a.get("attempt_id") != metadata.attempt_id]
+            current_folder = get_attempt_folder_name(metadata.attempt_number, profile_name=metadata.profile_name)
+            # Remove existing attempt with same ID or folder if updating
+            attempts = [
+                a for a in manifest["attempts"]
+                if a.get("attempt_id") != metadata.attempt_id and a.get("folder") != current_folder
+            ]
             attempt_summary = {
                 "attempt_number": metadata.attempt_number,
                 "attempt_id": metadata.attempt_id,
                 "status": metadata.status,
                 "timeout_stage": metadata.timeout_stage,
                 "ad_timeout_no_retry": metadata.ad_timeout_no_retry,
-                "folder": get_attempt_folder_name(metadata.attempt_number),
+                "folder": current_folder,
+                "profile_name": metadata.profile_name,
                 "depth_level": metadata.depth_level,
                 "parent_url": metadata.parent_url or metadata.normalized_url,
                 "started_at": metadata.started_at,
                 "ended_at": metadata.ended_at,
             }
             attempts.append(attempt_summary)
-            attempts.sort(key=lambda a: a.get("attempt_number", 0))
+            attempts.sort(key=lambda a: (a.get("attempt_number", 0), a.get("started_at", "")))
 
             manifest["attempts"] = attempts
             manifest["total_attempts"] = len(attempts)

@@ -48,6 +48,7 @@ from Collectors.InclusionTreeCollector import InclusionTreeCollector
 from Collectors.RequestCollector import RequestCollector
 from Collectors.ScreenshotCollector import ScreenshotCollector
 from Collectors.TargetCollector import TargetCollector
+from Collectors.ProfileCollector import ProfileCollector, copy_profile_to_target, get_profile_user_dir
 from Helpers.frame_correlator import correlate_and_annotate_events
 from Helpers.hasher import get_folder_name, get_registrable_domain, get_url_hash
 from Helpers.link_extractor import extract_internal_links
@@ -85,6 +86,7 @@ STAGE_TIMEOUTS = {
     "InclusionTreeCollector": 30.0,    # iframe/script inclusion trees
     "TargetCollector": 30.0,           # Window/target handles
     "AdDisclosureCollector": 30.0,     # Ad disclosure interaction phase
+    "ProfileCollector": 60.0,          # Profile interaction & same-domain link clicks
 }
 DEFAULT_STAGE_TIMEOUT = 15.0
 
@@ -107,26 +109,34 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timeout" in name or "timeout" in text
 
 
-def _launch_args() -> list[str]:
+def _launch_args(load_consentomatic: bool = True) -> list[str]:
     import os
-    extension_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "resources", "consent-o-matic"))
-    return [
+    args = [
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-infobars",
         "--disable-application-cache",
         "--disk-cache-size=0",
         "--window-size=1900,1000",
-        f"--disable-extensions-except={extension_path}",
-        f"--load-extension={extension_path}",
     ]
+    if load_consentomatic:
+        extension_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "resources", "consent-o-matic"))
+        args.extend([
+            f"--disable-extensions-except={extension_path}",
+            f"--load-extension={extension_path}",
+        ])
+    return args
 
 
-def _context_options() -> dict:
-    return {
+def _context_options(fake_location_preset: Any = None) -> dict:
+    options = {
         "viewport": {"width": 1900, "height": 1000},
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0",
     }
+    if fake_location_preset is not None:
+        from Helpers.fake_location import get_playwright_context_options
+        options.update(get_playwright_context_options(fake_location_preset))
+    return options
 async def _is_blocked(page) -> bool:
     """Return True if the loaded page looks like a bot-block / challenge page."""
     try:
@@ -541,6 +551,9 @@ async def crawl(
     max_links_per_page: int | None = None,
     exclude_links: set[str] | list[str] | None = None,
     root_seed_url: str | None = None,
+    fake_location: str | None = None,
+    profile_name: str | None = None,
+    profile_as_copy: bool | None = None,
 ) -> dict:
     """Crawl a URL with Playwright, run the requested collectors, and write results to disk."""
     if collectors is None:
@@ -548,6 +561,11 @@ async def crawl(
     collector_names = list(collectors)
 
     info = attempt_info or {}
+    profile_name = info.get("profile_name") or profile_name
+    profile_as_copy = info.get("profile_as_copy", profile_as_copy)
+    if profile_as_copy is None and profile_name:
+        profile_as_copy = bool(collector_names != [ProfileCollector.COLLECTOR_NAME])
+
     website_id = info.get("website_id") or generate_website_id(url)
     website_folder = info.get("website_folder") or get_website_folder_name(url)
     attempt_id = info.get("attempt_id") or generate_attempt_id()
@@ -591,10 +609,12 @@ async def crawl(
         "depth_level": depth_level,
         "parent": parent_url,
         "parent_url": parent_url,
+        "profile_name": profile_name,
+        "profile_as_copy": profile_as_copy,
     }
 
     url_hash = get_url_hash(url)
-    site_dir = get_attempt_dir(output_dir, website_folder, attempt_number, attempt_id)
+    site_dir = get_attempt_dir(output_dir, website_folder, attempt_number, attempt_id, profile_name=profile_name)
     site_dir.mkdir(parents=True, exist_ok=True)
 
     logger_name = f"crawler_{url_hash}_{uuid.uuid4().hex[:8]}"
@@ -635,12 +655,33 @@ async def crawl(
     prev_handler = setup_playwright_exception_handler()
 
     async with async_playwright() as pw:
-        user_data_dir = site_dir / ".pw_profile"
-        user_data_dir.mkdir(parents=True, exist_ok=True)
+        location_preset = None
+        if fake_location:
+            from Helpers.fake_location import (
+                apply_fake_location_to_context,
+                generate_fake_location_script,
+                resolve_location_preset,
+            )
+            location_preset = resolve_location_preset(fake_location)
+
+        if profile_name and not profile_as_copy:
+            # Profile Building: mount master persistent profile directory directly to accumulate signals
+            user_data_dir = get_profile_user_dir(profile_name)
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Using persistent master profile user_data_dir: {user_data_dir}")
+        elif profile_name and profile_as_copy:
+            # Profile Assignment: copy master profile into isolated attempt directory so crawl state is isolated
+            user_data_dir = site_dir / ".pw_profile"
+            logger.info(f"Creating isolated copy of profile '{profile_name}' for this visit -> {user_data_dir}")
+            copy_profile_to_target(profile_name, user_data_dir)
+        else:
+            user_data_dir = site_dir / ".pw_profile"
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+        load_consentomatic = not (profile_name and not profile_as_copy)
         launch_kwargs = {
             "headless": headless,
-            "args": _launch_args(),
-            **_context_options(),
+            "args": _launch_args(load_consentomatic=load_consentomatic),
+            **_context_options(location_preset),
         }
         if executable_path:
             launch_kwargs["executable_path"] = executable_path
@@ -651,6 +692,15 @@ async def crawl(
         )
         page = context.pages[0] if context.pages else await context.new_page()
 
+        if location_preset:
+            await apply_fake_location_to_context(context, location_preset)
+            await page.add_init_script(generate_fake_location_script(location_preset))
+            logger.info(
+                f"Fake location sensor active: {location_preset.country_name} ({location_preset.code}) - "
+                f"{location_preset.city} [{location_preset.latitude}, {location_preset.longitude}], "
+                f"tz={location_preset.timezone_id}, locale={location_preset.locale}"
+            )
+
         if _STEALTH_AVAILABLE:
             await _Stealth().apply_stealth_async(page)
             logger.info("Stealth mode applied")
@@ -658,6 +708,9 @@ async def crawl(
             await page.add_init_script(anti_bot_script())
         else:
             logger.info("Anti-bot script disabled")
+
+        if location_preset:
+            await page.add_init_script(generate_fake_location_script(location_preset))
 
         start_time_crawl = time.time()
         try:
@@ -704,6 +757,17 @@ async def crawl(
                     disc_col.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
                     await disc_col.pre_crawl(page)
                     pre_crawl_instances[name] = disc_col
+                elif name == ProfileCollector.COLLECTOR_NAME:
+                    prof_col = ProfileCollector()
+                    prof_col.init(
+                        str(site_dir),
+                        logger,
+                        url_hash,
+                        crawl_context=crawl_context,
+                        profile_name=profile_name,
+                    )
+                    await prof_col.pre_crawl(page)
+                    pre_crawl_instances[name] = prof_col
 
             if AdCollector.COLLECTOR_NAME in collector_names and AdDisclosureCollector.COLLECTOR_NAME not in pre_crawl_instances:
                 disc_col = AdDisclosureCollector()
@@ -829,6 +893,18 @@ async def crawl(
                 if name == CookiePopupsCollector.COLLECTOR_NAME:
                     cookie_popup_col = pre_crawl_instances.get(name)
                     return await cookie_popup_col.collect(page) if cookie_popup_col else []
+                if name == ProfileCollector.COLLECTOR_NAME:
+                    prof_col = pre_crawl_instances.get(name)
+                    if prof_col is None:
+                        prof_col = ProfileCollector()
+                        prof_col.init(
+                            str(site_dir),
+                            logger,
+                            url_hash,
+                            crawl_context=crawl_context,
+                            profile_name=profile_name,
+                        )
+                    return await prof_col.collect(page)
 
                 logger.warning(f"Unknown collector '{name}' — skipping")
                 return []
@@ -1161,6 +1237,9 @@ async def crawl(
                 logger.debug(f"Data quality report error: {dq_exc}")
                 result["data_quality_report"] = {}
 
+            if location_preset:
+                result["fake_location"] = location_preset.to_dict()
+
             # Clean ephemeral in-memory raw values before saving
             try:
                 api_inst = pre_crawl_instances.get(APICallCollector.COLLECTOR_NAME)
@@ -1218,6 +1297,7 @@ async def crawl(
                 depth_level=depth_level,
                 parent_url=parent_url,
                 schema_version=crawl_context.schema_version,
+                profile_name=profile_name,
             )
 
             # Crash-recovery checkpoint: write partial result before final atomic save
@@ -1247,14 +1327,17 @@ async def crawl(
             except Exception as exc:
                 logger.debug(f"Context close error: {exc}")
 
-            # Windows file-lock release retry loop
-            for rm_attempt in range(5):
-                try:
-                    if user_data_dir.exists():
-                        shutil.rmtree(user_data_dir)
-                    break
-                except Exception as exc:
-                    await asyncio.sleep(0.15 * (2 ** rm_attempt))
+            # Windows file-lock release retry loop:
+            # Clean up ephemeral attempt profile or temporary profile copy,
+            # but never delete the persistent master profile
+            if not profile_name or profile_as_copy:
+                for rm_attempt in range(5):
+                    try:
+                        if user_data_dir.exists():
+                            shutil.rmtree(user_data_dir)
+                        break
+                    except Exception as exc:
+                        await asyncio.sleep(0.15 * (2 ** rm_attempt))
 
     try:
         logger.info(f"Done. {total_ads} ad(s) found. Status: {status} -> {site_dir}")

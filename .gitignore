@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pkl
 .venv/
 venv/
 
@@ -29,6 +30,7 @@ resources/safeguard_audit.jsonl
 resources/emergency_save_failures.log
 
 # Crawl data and output directories
+analysis_outputs/
 crawl/
 data/
 data_*/
@@ -48,6 +50,7 @@ test_urls/
 test_urls_*/
 urls/
 kids_dataset_*/
+profiles/profile_*/
 cv_based_crawl/
 link_based_crawl/
 yahoo_temp_test*/
@@ -63,6 +66,7 @@ dashboard-vite/
 web/
 database/
 ad_disclosure_analysis_output/
+profiles/
 
 # Root-level media, HTML, PDF and images
 /*.png

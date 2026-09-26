@@ -28,6 +28,9 @@ ALIASES: dict[str, str] = {
     "disclosures": "AdDisclosureCollector",
     "addisclosure": "AdDisclosureCollector",
     "addisclosures": "AdDisclosureCollector",
+    "profile":     "ProfileCollector",
+    "profiles":    "ProfileCollector",
+    "profilecollector": "ProfileCollector",
 }
 
 # Every accepted name (canonical + aliases), for argparse choices validation
@@ -45,6 +48,7 @@ ALL_COLLECTORS: list[str] = [
     "TargetCollector",
     "InclusionTreeCollector",
     "AdDisclosureCollector",
+    "ProfileCollector",
 ]
 
 

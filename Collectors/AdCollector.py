@@ -1714,11 +1714,32 @@ class AdCollector:
                 self._n_removed_ads = n_removed_ads
                 self._logger.warning(f"[AdCollector] Screenshot error for ad_{index}: {exc}")
 
-        self._candidate_records = [
-            {
-                "ad_candidate_id": ad.get("ad_candidate_id"),
+        # Reconcile all detected ads so nDetectedAds == sum(outcomes) even when stage budgets/timeouts hit
+        accounted = len(ad_details) + n_small_ads + n_empty_ads + n_removed_ads + n_skipped_ads + n_timed_out_ads
+        unaccounted = max(0, len(ads) - accounted)
+        if unaccounted > 0:
+            n_timed_out_ads += unaccounted
+            self._n_timed_out_ads = n_timed_out_ads
+
+        # Build candidate records covering all detected ads
+        records = []
+        scraped_ids = {a.get("id") for a in ad_details if a.get("id")}
+        scraped_cand_ids = {a.get("ad_candidate_id") for a in ad_details if a.get("ad_candidate_id")}
+        for idx, ad in enumerate(ads):
+            cand_id = ad.get("ad_candidate_id") or f"cand_{idx + 1:03d}"
+            st = ad.get("_candidate_status")
+            if not st:
+                ad_id = ad.get("id")
+                if ad.get("ad_impression_id") or (cand_id in scraped_cand_ids) or (ad_id and ad_id in scraped_ids):
+                    st = "retained"
+                else:
+                    st = "timed_out"
+                    ad["_candidate_status"] = "timed_out"
+
+            records.append({
+                "ad_candidate_id": cand_id,
                 "ad_impression_id": ad.get("ad_impression_id"),
-                "candidate_status": ad.get("_candidate_status", "retained" if ad.get("ad_impression_id") else "removed"),
+                "candidate_status": st,
                 "matchedRule": ad.get("matchedRule"),
                 "nodeType": ad.get("nodeType"),
                 "id": ad.get("id"),
@@ -1726,9 +1747,8 @@ class AdCollector:
                 "height": ad.get("height"),
                 "x": ad.get("x"),
                 "y": ad.get("y"),
-            }
-            for ad in ads_to_process
-        ]
+            })
+        self._candidate_records = records
 
         scrape_results = {
             "nDetectedAds": len(ads),
@@ -1739,6 +1759,7 @@ class AdCollector:
             "nSkippedAds": n_skipped_ads,
             "nTimedOutAds": n_timed_out_ads,
         }
+        
         self._scrape_results = scrape_results
         return ad_details, scrape_results
 

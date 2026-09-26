@@ -5,6 +5,7 @@ import asyncio
 import csv
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import re
 import shutil
@@ -125,7 +126,7 @@ def _load_urls_from_file(path: Path) -> list[str]:
     return urls
 
 
-def _resolve_urls(args: argparse.Namespace) -> list[str]:
+def _resolve_urls(args: argparse.Namespace, is_profile_building: bool = False) -> list[str]:
     if args.url:
         norm = _normalize_seed_url(args.url)
         return [norm or args.url]
@@ -136,6 +137,30 @@ def _resolve_urls(args: argparse.Namespace) -> list[str]:
             print(f"[ERR] --urls file not found: {p}", file=sys.stderr)
             sys.exit(1)
         return _load_urls_from_file(p)
+
+    # In Profile Building mode (ProfileCollector is the only collector),
+    # auto-load URLs from resources/profile_urls.py if neither --url nor --urls was given.
+    if is_profile_building and getattr(args, "profile", None):
+        from resources.profile_urls import profile_directory
+        prof = args.profile
+        if isinstance(prof, list):
+            prof = prof[0] if prof else ""
+        prof = str(prof).strip().lower()
+        if ":" in prof:
+            prof = prof.split(":", 1)[0]
+        elif "_" in prof and prof.startswith("all_"):
+            prof = "all"
+        if prof.startswith("profile_"):
+            prof = prof[len("profile_"):]
+        if prof in profile_directory:
+            return list(profile_directory[prof])
+        elif prof == "all":
+            all_urls: list[str] = []
+            for plist in profile_directory.values():
+                for u in plist:
+                    if u not in all_urls:
+                        all_urls.append(u)
+            return all_urls
 
     default = Path("urls.txt")
     if default.is_file():
@@ -172,6 +197,11 @@ async def _run_all(
     use_safeguards: bool = False,
     production_mode: bool = False,
     depth: tuple[int, int] | list[int] | None = None,
+    fake_location: str | None = None,
+    profile_name: str | None = None,
+    profile_as_copy: bool = True,
+    multi_profile_profiles: list[str] | None = None,
+    chunk_percent: float = 10.0,
 ) -> None:
     crawl_id = f"crawl_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     from crawler import setup_playwright_exception_handler
@@ -215,8 +245,11 @@ async def _run_all(
         extract_links: bool,
         root_seed_url: str | None = None,
         exclude_links: set[str] | None = None,
+        profile_override: str | None = None,
     ) -> dict:
         effective_parent = parent_url if (depth_level > 0 and parent_url) else url
+        effective_profile = profile_override if profile_override is not None else profile_name
+        effective_profile_as_copy = True if effective_profile else profile_as_copy
         crawl_kwargs = {
             "output_dir": output_dir,
             "timeout": timeout,
@@ -232,6 +265,9 @@ async def _run_all(
             "max_links_per_page": max_links if extract_links else None,
             "exclude_links": exclude_links,
             "root_seed_url": root_seed_url,
+            "fake_location": fake_location,
+            "profile_name": effective_profile,
+            "profile_as_copy": effective_profile_as_copy,
             "attempt_info": {
                 "depth_level": depth_level,
                 "depth": depth_level,
@@ -239,6 +275,8 @@ async def _run_all(
                 "parent": effective_parent,
                 "crawl_id": crawl_id,
                 "input_index": seed_idx,
+                "profile_name": effective_profile,
+                "profile_as_copy": effective_profile_as_copy,
             },
         }
         if use_safeguards and engine is not None:
@@ -365,18 +403,28 @@ async def _run_all(
             if clean_key:
                 visited_url_keys.add(clean_key)
 
-            if is_url_already_completed(output_dir, clean_u):
-                print(f"[SKIP] [Already Completed] {clean_u}")
-                if is_depth_crawl and max_depth > 0:
-                    saved_links = _get_links_from_completed_site(output_dir, clean_u, max_links)
-                    for slink in saved_links:
-                        slink_key = canonical_url_key(slink)
-                        if slink_key and slink_key not in visited_url_keys and not is_url_already_completed(output_dir, slink):
-                            visited_url_keys.add(slink_key)
-                            visited_urls.add(slink)
-                            depth_layer1_from_completed.append((slink, 1, clean_u, idx, clean_u))
+            if multi_profile_profiles:
+                all_done = all(
+                    is_url_already_completed(output_dir, clean_u, profile_name=p)
+                    for p in multi_profile_profiles
+                )
+                if all_done:
+                    print(f"[SKIP] [All Profiles Completed] {clean_u}")
+                else:
+                    current_layer.append((clean_u, 0, clean_u, idx, clean_u))
             else:
-                current_layer.append((clean_u, 0, clean_u, idx, clean_u))
+                if is_url_already_completed(output_dir, clean_u, profile_name=profile_name):
+                    print(f"[SKIP] [Already Completed] {clean_u}")
+                    if is_depth_crawl and max_depth > 0:
+                        saved_links = _get_links_from_completed_site(output_dir, clean_u, max_links)
+                        for slink in saved_links:
+                            slink_key = canonical_url_key(slink)
+                            if slink_key and slink_key not in visited_url_keys and not is_url_already_completed(output_dir, slink, profile_name=profile_name):
+                                visited_url_keys.add(slink_key)
+                                visited_urls.add(slink)
+                                depth_layer1_from_completed.append((slink, 1, clean_u, idx, clean_u))
+                else:
+                    current_layer.append((clean_u, 0, clean_u, idx, clean_u))
 
     current_depth_level = 0
     if not current_layer and depth_layer1_from_completed:
@@ -386,75 +434,197 @@ async def _run_all(
         save_entries = [(u, d, p) for u, d, p, _si, _r in current_layer]
         _save_discovered_urls(save_entries, 1, urls[0] if urls else "unknown")
         print(f"[DEPTH] Seed already completed; progressing directly to Depth 1 with {len(current_layer)} URL(s)")
+    elif multi_profile_profiles:
+        total_planned = len(current_layer) * len(multi_profile_profiles)
 
     try:
         while current_layer:
             should_extract = bool(is_depth_crawl and current_depth_level < max_depth and max_links > 0)
             next_layer: list[tuple[str, int, str | None, int, str]] = []
-            semaphore = asyncio.Semaphore(num_workers)
 
-            async def _crawl_one_in_layer(url: str, depth_lvl: int, parent: str | None, seed_idx: int, root_url: str) -> None:
-                nonlocal completed
-                # Stagger initial concurrent worker spin-up to prevent simultaneous network & DNS spikes
-                if num_workers > 1 and seed_idx < num_workers:
-                    await asyncio.sleep(seed_idx * 0.75)
+            if multi_profile_profiles:
+                # 10% Chunk Execution across profiles:
+                # Profile 1 processes 10% of total websites, then Profile 2 processes the SAME 10% of total websites, etc.
+                # When all profiles finish that 10% chunk, only then proceed to the next 10% chunk.
+                total_in_layer = len(current_layer)
+                pct = max(1.0, min(100.0, float(chunk_percent)))
+                chunk_size = max(1, math.ceil(total_in_layer * (pct / 100.0)))
+                chunks = [
+                    current_layer[i : i + chunk_size]
+                    for i in range(0, total_in_layer, chunk_size)
+                ]
 
-                async with semaphore:
-                    try:
-                        result = await _crawl_single(
-                            url,
-                            seed_idx,
-                            depth_lvl,
-                            parent,
-                            extract_links=should_extract,
-                            root_seed_url=root_url,
-                            exclude_links=set(visited_urls),
+                print(
+                    f"\n[MULTI-PROFILE] Processing {total_in_layer} website(s) in {len(chunks)} chunk(s) "
+                    f"({pct}% per chunk = ~{chunk_size} website(s)) across {len(multi_profile_profiles)} profile(s) "
+                    f"({', '.join(multi_profile_profiles)})..."
+                )
+
+                for chunk_idx, chunk in enumerate(chunks, start=1):
+                    chunk_pct_start = int(((chunk_idx - 1) * chunk_size / total_in_layer) * 100)
+                    chunk_pct_end = min(100, int((chunk_idx * chunk_size / total_in_layer) * 100))
+                    print(
+                        f"\n{'='*75}\n"
+                        f"[MULTI-PROFILE] Chunk {chunk_idx}/{len(chunks)} "
+                        f"({chunk_pct_start}%-{chunk_pct_end}% of total websites: {len(chunk)} site(s))\n"
+                        f"{'='*75}"
+                    )
+
+                    for p_num, prof in enumerate(multi_profile_profiles, start=1):
+                        sites_to_run = [
+                            item for item in chunk
+                            if not is_url_already_completed(output_dir, item[0], profile_name=prof)
+                        ]
+                        sites_already_done = [
+                            item for item in chunk
+                            if is_url_already_completed(output_dir, item[0], profile_name=prof)
+                        ]
+
+                        for done_item in sites_already_done:
+                            print(f"[SKIP] [Already Completed] {done_item[0]} (profile_{prof})")
+
+                        if not sites_to_run:
+                            print(
+                                f"[MULTI-PROFILE] Profile {p_num}/{len(multi_profile_profiles)} ('profile_{prof}') "
+                                f"already completed all {len(chunk)} website(s) in Chunk {chunk_idx}."
+                            )
+                            continue
+
+                        print(
+                            f"\n[MULTI-PROFILE] Profile {p_num}/{len(multi_profile_profiles)} ('profile_{prof}') "
+                            f"starting Chunk {chunk_idx} ({len(sites_to_run)}/{len(chunk)} website(s) remaining, concurrency={num_workers})..."
                         )
-                        tag = _result_tag(result)
-                        ads = _result_ads(result)
 
-                        async with progress_lock:
-                            completed += 1
-                            progress = _progress_tag(completed, total_planned, depth_lvl)
+                        prof_semaphore = asyncio.Semaphore(num_workers)
 
-                        if tag == "SKIP":
-                            reason = result.get("safeguard_reason", "unknown")
-                            print(f"[SKIP] {progress} {url}  ->  safeguard: {reason}")
-                        else:
-                            print(f"[{tag}] {progress} {url}  ->  {ads} ad(s)  |  {result.get('finalUrl', url)}")
+                        async def _crawl_site_for_profile(site_info: tuple[str, int, str | None, int, str], s_idx: int) -> None:
+                            nonlocal completed
+                            url, depth_lvl, parent, seed_idx, root_url = site_info
+                            if num_workers > 1 and s_idx < num_workers:
+                                await asyncio.sleep(s_idx * 0.5)
 
-                        # Collect discovered links for the next layer (excluding already completed and visited URLs)
-                        if should_extract and result.get("discovered_links"):
+                            async with prof_semaphore:
+                                try:
+                                    result = await _crawl_single(
+                                        url,
+                                        seed_idx,
+                                        depth_lvl,
+                                        parent,
+                                        extract_links=should_extract,
+                                        root_seed_url=root_url,
+                                        exclude_links=set(visited_urls),
+                                        profile_override=prof,
+                                    )
+                                    tag = _result_tag(result)
+                                    ads = _result_ads(result)
+                                    async with progress_lock:
+                                        completed += 1
+                                        progress = _progress_tag(completed, total_planned, depth_lvl)
+
+                                    if tag == "SKIP":
+                                        reason = result.get("safeguard_reason", "unknown")
+                                        print(f"[SKIP] {progress} [profile_{prof}] {url}  ->  safeguard: {reason}")
+                                    else:
+                                        print(f"[{tag}] {progress} [profile_{prof}] {url}  ->  {ads} ad(s)  |  {result.get('finalUrl', url)}")
+
+                                    if should_extract and result.get("discovered_links"):
+                                        async with progress_lock:
+                                            for link in result["discovered_links"]:
+                                                link_key = canonical_url_key(link)
+                                                parent_key = canonical_url_key(parent)
+                                                curr_key = canonical_url_key(url)
+                                                root_key = canonical_url_key(root_url)
+
+                                                if not link_key or link_key in (curr_key, parent_key, root_key) or link_key in visited_url_keys:
+                                                    continue
+                                                all_link_done = all(
+                                                    is_url_already_completed(output_dir, link, profile_name=lp)
+                                                    for lp in multi_profile_profiles
+                                                )
+                                                if all_link_done:
+                                                    continue
+                                                visited_url_keys.add(link_key)
+                                                visited_urls.add(link)
+                                                next_layer.append((link, depth_lvl + 1, url, seed_idx, root_url))
+                                except Exception as exc:
+                                    async with progress_lock:
+                                        completed += 1
+                                        progress = _progress_tag(completed, total_planned, depth_lvl)
+                                    print(f"[ERR] {progress} [profile_{prof}] {url}  ->  {exc}", file=sys.stderr)
+
+                        site_tasks = [
+                            asyncio.create_task(_crawl_site_for_profile(item, s_idx))
+                            for s_idx, item in enumerate(sites_to_run)
+                        ]
+                        await asyncio.gather(*site_tasks)
+                        print(f"[MULTI-PROFILE] Profile {p_num}/{len(multi_profile_profiles)} ('profile_{prof}') finished Chunk {chunk_idx}.")
+
+                    print(f"\n[MULTI-PROFILE] Chunk {chunk_idx}/{len(chunks)} fully processed across ALL {len(multi_profile_profiles)} profiles!")
+            else:
+                semaphore = asyncio.Semaphore(num_workers)
+
+                async def _crawl_one_in_layer(url: str, depth_lvl: int, parent: str | None, seed_idx: int, root_url: str) -> None:
+                    nonlocal completed
+                    # Stagger initial concurrent worker spin-up to prevent simultaneous network & DNS spikes
+                    if num_workers > 1 and seed_idx < num_workers:
+                        await asyncio.sleep(seed_idx * 0.75)
+
+                    async with semaphore:
+                        try:
+                            result = await _crawl_single(
+                                url,
+                                seed_idx,
+                                depth_lvl,
+                                parent,
+                                extract_links=should_extract,
+                                root_seed_url=root_url,
+                                exclude_links=set(visited_urls),
+                            )
+                            tag = _result_tag(result)
+                            ads = _result_ads(result)
+
                             async with progress_lock:
-                                for link in result["discovered_links"]:
-                                    link_key = canonical_url_key(link)
-                                    parent_key = canonical_url_key(parent)
-                                    curr_key = canonical_url_key(url)
-                                    root_key = canonical_url_key(root_url)
+                                completed += 1
+                                progress = _progress_tag(completed, total_planned, depth_lvl)
 
-                                    if not link_key:
-                                        continue
-                                    if link_key in (curr_key, parent_key, root_key):
-                                        continue
-                                    if link_key in visited_url_keys:
-                                        continue
-                                    if is_url_already_completed(output_dir, link):
-                                        continue
+                            if tag == "SKIP":
+                                reason = result.get("safeguard_reason", "unknown")
+                                print(f"[SKIP] {progress} {url}  ->  safeguard: {reason}")
+                            else:
+                                print(f"[{tag}] {progress} {url}  ->  {ads} ad(s)  |  {result.get('finalUrl', url)}")
 
-                                    visited_url_keys.add(link_key)
-                                    visited_urls.add(link)
-                                    next_layer.append((link, depth_lvl + 1, url, seed_idx, root_url))
-                    except Exception as exc:
-                        async with progress_lock:
-                            completed += 1
-                            progress = _progress_tag(completed, total_planned, depth_lvl)
-                        print(f"[ERR] {progress} {url}  ->  {exc}", file=sys.stderr)
+                            # Collect discovered links for the next layer (excluding already completed and visited URLs)
+                            if should_extract and result.get("discovered_links"):
+                                async with progress_lock:
+                                    for link in result["discovered_links"]:
+                                        link_key = canonical_url_key(link)
+                                        parent_key = canonical_url_key(parent)
+                                        curr_key = canonical_url_key(url)
+                                        root_key = canonical_url_key(root_url)
 
-            tasks = [
-                asyncio.create_task(_crawl_one_in_layer(url, d, p, si, r))
-                for url, d, p, si, r in current_layer
-            ]
-            await asyncio.gather(*tasks)
+                                        if not link_key:
+                                            continue
+                                        if link_key in (curr_key, parent_key, root_key):
+                                            continue
+                                        if link_key in visited_url_keys:
+                                            continue
+                                        if is_url_already_completed(output_dir, link, profile_name=profile_name):
+                                            continue
+
+                                        visited_url_keys.add(link_key)
+                                        visited_urls.add(link)
+                                        next_layer.append((link, depth_lvl + 1, url, seed_idx, root_url))
+                        except Exception as exc:
+                            async with progress_lock:
+                                completed += 1
+                                progress = _progress_tag(completed, total_planned, depth_lvl)
+                            print(f"[ERR] {progress} {url}  ->  {exc}", file=sys.stderr)
+
+                tasks = [
+                    asyncio.create_task(_crawl_one_in_layer(url, d, p, si, r))
+                    for url, d, p, si, r in current_layer
+                ]
+                await asyncio.gather(*tasks)
 
             # Prepare next layer
             if next_layer and is_depth_crawl and current_depth_level < max_depth:
@@ -540,6 +710,37 @@ def main() -> None:
             "Connect Proton VPN before crawling. "
             "Pass country initials (e.g. US, FR, DE, UK) or full name (e.g. 'United States'). "
             "If no argument is passed (just -vpn), opens an interactive shell to select the country."
+        ),
+    )
+
+    parser.add_argument(
+        "-loc",
+        "--location",
+        "--fake-location",
+        "--geo",
+        dest="fake_location",
+        type=str,
+        default=None,
+        metavar="PRESET",
+        help=(
+            "Simulate geographic location and sensor data without VPN using presets. "
+            "Preset options: FR (France), NL (Netherlands), JP (Japan), US (United States), "
+            "DE (Germany), UK/GB (United Kingdom), CA (Canada), AU (Australia), etc., "
+            "or custom coordinates 'lat,lon' (e.g. '48.8566,2.3522')."
+        ),
+    )
+
+    parser.add_argument(
+        "-p",
+        "--profile",
+        dest="profile",
+        nargs="+",
+        default=None,
+        metavar="PROFILE_NAME",
+        help=(
+            "Persona profile to build or use (e.g. 'finance', 'shopping', 'sports', 'news', 'random', or 'all [N]'). "
+            "When used during crawl with 'all [N]', runs up to N parallel crawls across all profiles site-by-site "
+            "(synchronization barrier per website), overriding -c. Creates/uses persistent user_dir 'profile_<name>' in profiles/."
         ),
     )
 
@@ -677,6 +878,27 @@ def main() -> None:
         metavar="DOMAIN",
         help="Reset safeguard state and daily limits for a specific domain and exit.",
     )
+    parser.add_argument(
+        "--chunk-percent",
+        dest="chunk_percent",
+        type=float,
+        default=10.0,
+        help="Percentage of total websites processed per chunk during multi-profile crawling (default: 10.0%%).",
+    )
+    parser.add_argument(
+        "--min-delay",
+        dest="min_delay",
+        type=float,
+        default=45.0,
+        help="Minimum randomized delay between actions during profile creation in seconds (default: 45.0).",
+    )
+    parser.add_argument(
+        "--max-delay",
+        dest="max_delay",
+        type=float,
+        default=75.0,
+        help="Maximum randomized delay between actions during profile creation in seconds (default: 75.0).",
+    )
 
 
     args = parser.parse_args()
@@ -695,15 +917,102 @@ def main() -> None:
         raw_collectors.extend(args.collectors)
     if args.positional_collectors:
         raw_collectors.extend(args.positional_collectors)
+
+    # Parse profile argument tokens (supports '--profile all 4', '--profile all:4', '--profile finance', etc.)
+    profile_raw_tokens: list[str] = []
+    if args.profile:
+        if isinstance(args.profile, list):
+            profile_raw_tokens = [str(x).strip() for x in args.profile if str(x).strip()]
+        else:
+            profile_raw_tokens = [str(args.profile).strip()]
+
+    profile_target: str | None = None
+    profile_concurrency: int | None = None
+
+    if profile_raw_tokens:
+        first = profile_raw_tokens[0].lower()
+        if ":" in first:
+            p_parts = first.split(":", 1)
+            profile_target = p_parts[0]
+            if p_parts[1].isdigit():
+                profile_concurrency = int(p_parts[1])
+        elif "_" in first and first.startswith("all_") and first[4:].isdigit():
+            profile_target = "all"
+            profile_concurrency = int(first[4:])
+        else:
+            profile_target = first
+            if len(profile_raw_tokens) > 1 and profile_raw_tokens[1].isdigit():
+                profile_concurrency = int(profile_raw_tokens[1])
+
+        if profile_target and profile_target.startswith("profile_") and profile_target != "profile_all":
+            profile_target = profile_target[len("profile_"):]
+
     if not raw_collectors:
-        raw_collectors = ["ads"]
+        if profile_target:
+            raw_collectors = ["ProfileCollector"]
+        else:
+            raw_collectors = ["ads"]
 
     split_collectors: list[str] = []
     for token in raw_collectors:
         split_collectors.extend([c for c in token.split(",") if c])
     args.collectors = resolve_all(split_collectors)
 
-    urls = _resolve_urls(args)
+    # Determine whether we are in Profile Building mode or Profile Assignment mode:
+    # "if it's the only collector used is profilecollector then it's building profiles, else it's used as a profile!"
+    is_profile_building = bool(profile_target and args.collectors == ["ProfileCollector"])
+    norm_profile: str | None = None
+    multi_profile_active: bool = False
+    available_target_profiles: list[str] = []
+
+    if profile_target:
+        if is_profile_building:
+            # Mode A: Profile Building Mode
+            from resources.profile_urls import profile_directory
+            if profile_target != "all" and profile_target not in profile_directory:
+                parser.error(
+                    f"Unknown profile '{profile_target}' to build. Available profile categories: {list(profile_directory.keys())} or 'all'"
+                )
+            if profile_concurrency is not None:
+                args.crawlers = max(1, profile_concurrency)
+            norm_profile = profile_target
+        else:
+            # Mode B: Profile Assignment Mode (crawling with other data collectors)
+            from Collectors.ProfileCollector import get_available_profiles, get_profile_user_dir, profile_exists
+            if profile_target == "all":
+                available_target_profiles = get_available_profiles()
+                if not available_target_profiles:
+                    parser.error(
+                        "No built persona profiles found in profiles/. "
+                        "Please build profiles first using: python cli.py --profile all"
+                    )
+                multi_profile_active = True
+                norm_profile = "all"
+                if profile_concurrency is not None:
+                    args.crawlers = max(1, profile_concurrency)
+                print(
+                    f"[INFO] Multi-profile crawling active for {len(available_target_profiles)} profile(s) "
+                    f"({', '.join(available_target_profiles)}). "
+                    f"Profile concurrency = {args.crawlers} parallel crawl(s) (overrides -c; site-by-site synchronization barrier)."
+                )
+            else:
+                if not profile_exists(profile_target):
+                    avail = get_available_profiles()
+                    avail_str = f" Available built profiles: {', '.join(avail)}." if avail else " No built profiles found in profiles/."
+                    parser.error(
+                        f"Profile '{profile_target}' does not exist (directory not found: {get_profile_user_dir(profile_target)})."
+                        f"{avail_str} Please build the profile first using: python cli.py --profile {profile_target}"
+                    )
+                if profile_concurrency is not None:
+                    args.crawlers = max(1, profile_concurrency)
+                norm_profile = profile_target
+                if args.crawlers > 1:
+                    print(
+                        f"[INFO] Profile persona assignment active ('profile_{norm_profile}'). "
+                        f"Running {args.crawlers} parallel crawlers, each using an isolated copy of the profile."
+                    )
+
+    urls = _resolve_urls(args, is_profile_building=is_profile_building)
     if not urls:
         parser.error(
             "No URLs found. Use --url <URL> or --urls <file.txt/csv>, "
@@ -732,7 +1041,10 @@ def main() -> None:
             print(f"[ERR] Failed to prepare custom Chromium: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    active_crawlers = max(1, min(args.crawlers, len(urls)))
+    if multi_profile_active:
+        active_crawlers = max(1, min(args.crawlers, len(available_target_profiles)))
+    else:
+        active_crawlers = max(1, min(args.crawlers, len(urls)))
     info = [
         f"Crawling {len(urls)} URL(s)",
         f"collectors={args.collectors}",
@@ -748,6 +1060,13 @@ def main() -> None:
         from Helpers.vpn import resolve_country
         v_code, v_name = resolve_country(args.vpn)
         info.append(f"vpn={v_name} ({v_code})")
+    if args.fake_location:
+        from Helpers.fake_location import resolve_location_preset
+        try:
+            loc_preset = resolve_location_preset(args.fake_location)
+            info.append(f"location={loc_preset.country_name} ({loc_preset.code})")
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.headless:
         info.append("headless")
     if args.use_anti_bot:
@@ -797,11 +1116,68 @@ def main() -> None:
         return
 
 
+    if args.profile:
+        mode_label = "build" if is_profile_building else "assign"
+        prof_display = " ".join(profile_raw_tokens) if profile_raw_tokens else str(args.profile)
+        info.append(f"profile={prof_display} ({mode_label})")
     if args.use_safeguards:
         info.append("safeguards=ON")
     if args.production_mode:
         info.append("production")
     print("  |  ".join(info))
+
+    if args.profile and is_profile_building:
+        from Collectors.ProfileCollector import ProfileCollector
+        collector = ProfileCollector()
+        active_timeout = 15.0 if args.timeout == 30 else float(args.timeout)
+
+        if norm_profile == "all":
+            print(f"\n[PROFILE BUILD] Building ALL profiles concurrently (crawlers={active_crawlers}, max 5 open websites at the same time per browser)...")
+            summary = asyncio.run(
+                collector.build_all_profiles(
+                    timeout_per_site=active_timeout,
+                    settle_sec=1.0,
+                    headless=args.headless,
+                    parallel_crawls=active_crawlers,
+                    max_open_pages_per_browser=5,
+                    executable_path=executable_path,
+                    action_delay_min=args.min_delay,
+                    action_delay_max=args.max_delay,
+                )
+            )
+            print("\n[PROFILE BUILD] Successfully built all persona profiles.")
+            recap_file = Path("profiles") / "recap.json"
+            if recap_file.is_file():
+                print(f"[RECAP] Operation recap saved -> {recap_file.resolve()}")
+            return
+        else:
+            custom_urls = urls if (args.url or args.urls) else None
+            url_count_desc = f"{len(custom_urls)} custom URLs" if custom_urls else "default profile URLs"
+            print(f"\n[PROFILE BUILD] Building profile 'profile_{norm_profile}' ({url_count_desc}, max 5 open websites at the same time)...")
+            summary = asyncio.run(
+                collector.build_profile(
+                    profile_name=norm_profile,
+                    timeout_per_site=active_timeout,
+                    settle_sec=1.0,
+                    headless=args.headless,
+                    custom_urls=custom_urls,
+                    parallel_crawls=active_crawlers,
+                    max_open_pages=5,
+                    executable_path=executable_path,
+                    action_delay_min=args.min_delay,
+                    action_delay_max=args.max_delay,
+                )
+            )
+            print(
+                f"\n[PROFILE BUILD] Finished 'profile_{norm_profile}': "
+                f"{summary.get('successful_sites', 0)}/{summary.get('sites_visited', 0)} sites visited, "
+                f"{summary.get('accumulated_cookies_count', 0)} cookies stored in {summary.get('user_dir')}."
+            )
+            recap_file = Path("profiles") / "recap.json"
+            if recap_file.is_file():
+                print(f"[RECAP] Operation recap updated -> {recap_file.resolve()}")
+            return
+
     asyncio.run(
         _run_all(
             urls,
@@ -817,6 +1193,11 @@ def main() -> None:
             use_safeguards=args.use_safeguards,
             production_mode=args.production_mode,
             depth=depth_config,
+            fake_location=args.fake_location,
+            profile_name=norm_profile,
+            profile_as_copy=bool(norm_profile and not is_profile_building),
+            multi_profile_profiles=available_target_profiles if multi_profile_active else None,
+            chunk_percent=args.chunk_percent,
         )
     )
 
