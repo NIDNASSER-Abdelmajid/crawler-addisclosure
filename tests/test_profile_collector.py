@@ -524,64 +524,53 @@ def test_attempt_profile_folder_naming(tmp_path: Path):
 
 
 def test_cli_profile_all_parsing_and_concurrency_override():
-    """Verify CLI argument parsing for --profile all <N> and that profile concurrency overrides -c."""
-    import argparse
-    from cli import main
-
-    # Helper function mirroring main()'s profile parsing logic
-    def parse_profile_tokens(profile_arg):
-        profile_raw_tokens = []
-        if profile_arg:
-            if isinstance(profile_arg, list):
-                profile_raw_tokens = [str(x).strip() for x in profile_arg if str(x).strip()]
-            else:
-                profile_raw_tokens = [str(profile_arg).strip()]
-
-        profile_target = None
-        profile_concurrency = None
-        if profile_raw_tokens:
-            first = profile_raw_tokens[0].lower()
-            if ":" in first:
-                p_parts = first.split(":", 1)
-                profile_target = p_parts[0]
-                if p_parts[1].isdigit():
-                    profile_concurrency = int(p_parts[1])
-            elif "_" in first and first.startswith("all_") and first[4:].isdigit():
-                profile_target = "all"
-                profile_concurrency = int(first[4:])
-            else:
-                profile_target = first
-                if len(profile_raw_tokens) > 1 and profile_raw_tokens[1].isdigit():
-                    profile_concurrency = int(profile_raw_tokens[1])
-
-            if profile_target and profile_target.startswith("profile_") and profile_target != "profile_all":
-                profile_target = profile_target[len("profile_"):]
-        return profile_target, profile_concurrency
+    """Verify CLI argument parsing for --profile, including all, single, and specific multiple profiles."""
+    from cli import parse_profile_arguments
 
     # Test '--profile all 3'
-    target, conc = parse_profile_tokens(["all", "3"])
+    target, conc, req = parse_profile_arguments(["all", "3"])
     assert target == "all"
     assert conc == 3
+    assert req == ["all"]
 
     # Test '--profile all:4'
-    target, conc = parse_profile_tokens(["all:4"])
+    target, conc, req = parse_profile_arguments(["all:4"])
     assert target == "all"
     assert conc == 4
+    assert req == ["all"]
 
     # Test '--profile all' (no number)
-    target, conc = parse_profile_tokens(["all"])
+    target, conc, req = parse_profile_arguments(["all"])
     assert target == "all"
     assert conc is None
 
     # Test '--profile finance'
-    target, conc = parse_profile_tokens(["finance"])
+    target, conc, req = parse_profile_arguments(["finance"])
     assert target == "finance"
     assert conc is None
 
     # Test '--profile profile_sports'
-    target, conc = parse_profile_tokens(["profile_sports"])
+    target, conc, req = parse_profile_arguments(["profile_sports"])
     assert target == "sports"
     assert conc is None
+
+    # Test specific multiple profiles: '--profile finance shopping travel 3'
+    target, conc, req = parse_profile_arguments(["finance", "shopping", "travel", "3"])
+    assert target == "multi"
+    assert conc == 3
+    assert req == ["finance", "shopping", "travel"]
+
+    # Test specific multiple profiles comma-separated: '--profile finance,shopping,travel'
+    target, conc, req = parse_profile_arguments(["finance,shopping,travel"])
+    assert target == "multi"
+    assert conc is None
+    assert req == ["finance", "shopping", "travel"]
+
+    # Test specific multiple profiles comma-separated with suffix: '--profile finance,shopping,travel:3'
+    target, conc, req = parse_profile_arguments(["finance,shopping,travel:3"])
+    assert target == "multi"
+    assert conc == 3
+    assert req == ["finance", "shopping", "travel"]
 
 
 @pytest.mark.asyncio

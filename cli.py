@@ -641,6 +641,69 @@ async def _run_all(
             state.close()
 
 
+def parse_profile_arguments(profile_arg: list[str] | str | None) -> tuple[str | None, int | None, list[str]]:
+    """Parse --profile argument tokens into (profile_target, profile_concurrency, requested_profiles).
+
+    Supports:
+    - '--profile all 4' or '--profile all:4' or '--profile all'
+    - Single profile: '--profile finance' or '--profile profile_finance 2'
+    - Specific multiple profiles:
+      - '--profile finance shopping travel'
+      - '--profile finance shopping travel 3'
+      - '--profile finance,shopping,travel'
+      - '--profile finance,shopping,travel:3' or '--profile finance,shopping,travel 3'
+    """
+    if not profile_arg:
+        return None, None, []
+
+    profile_raw_tokens: list[str] = []
+    raw_list = profile_arg if isinstance(profile_arg, list) else [profile_arg]
+    for item in raw_list:
+        for part in str(item).replace(",", " ").split():
+            if part.strip():
+                profile_raw_tokens.append(part.strip())
+
+    if not profile_raw_tokens:
+        return None, None, []
+
+    profile_concurrency: int | None = None
+
+    # Check if the last token is a pure concurrency number (when preceding tokens exist)
+    if len(profile_raw_tokens) > 1 and profile_raw_tokens[-1].isdigit():
+        profile_concurrency = int(profile_raw_tokens.pop())
+
+    cleaned_tokens: list[str] = []
+    for tok in profile_raw_tokens:
+        if ":" in tok:
+            p_parts = tok.split(":", 1)
+            cleaned_tokens.append(p_parts[0])
+            if p_parts[1].isdigit():
+                profile_concurrency = int(p_parts[1])
+        elif "_" in tok and tok.lower().startswith("all_") and tok[4:].isdigit():
+            cleaned_tokens.append("all")
+            profile_concurrency = int(tok[4:])
+        else:
+            cleaned_tokens.append(tok)
+
+    requested_profiles: list[str] = []
+    for tok in cleaned_tokens:
+        clean_name = tok.lower()
+        if clean_name.startswith("profile_") and clean_name != "profile_all":
+            clean_name = clean_name[len("profile_"):]
+        if clean_name and clean_name not in requested_profiles:
+            requested_profiles.append(clean_name)
+
+    if not requested_profiles:
+        return None, profile_concurrency, []
+
+    if "all" in requested_profiles:
+        return "all", profile_concurrency, ["all"]
+    elif len(requested_profiles) == 1:
+        return requested_profiles[0], profile_concurrency, requested_profiles
+    else:
+        return "multi", profile_concurrency, requested_profiles
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="AdGraph Playwright Crawler — detect and screenshot ads on web pages",
@@ -918,34 +981,7 @@ def main() -> None:
     if args.positional_collectors:
         raw_collectors.extend(args.positional_collectors)
 
-    # Parse profile argument tokens (supports '--profile all 4', '--profile all:4', '--profile finance', etc.)
-    profile_raw_tokens: list[str] = []
-    if args.profile:
-        if isinstance(args.profile, list):
-            profile_raw_tokens = [str(x).strip() for x in args.profile if str(x).strip()]
-        else:
-            profile_raw_tokens = [str(args.profile).strip()]
-
-    profile_target: str | None = None
-    profile_concurrency: int | None = None
-
-    if profile_raw_tokens:
-        first = profile_raw_tokens[0].lower()
-        if ":" in first:
-            p_parts = first.split(":", 1)
-            profile_target = p_parts[0]
-            if p_parts[1].isdigit():
-                profile_concurrency = int(p_parts[1])
-        elif "_" in first and first.startswith("all_") and first[4:].isdigit():
-            profile_target = "all"
-            profile_concurrency = int(first[4:])
-        else:
-            profile_target = first
-            if len(profile_raw_tokens) > 1 and profile_raw_tokens[1].isdigit():
-                profile_concurrency = int(profile_raw_tokens[1])
-
-        if profile_target and profile_target.startswith("profile_") and profile_target != "profile_all":
-            profile_target = profile_target[len("profile_"):]
+    profile_target, profile_concurrency, requested_profiles = parse_profile_arguments(args.profile)
 
     if not raw_collectors:
         if profile_target:
@@ -961,7 +997,7 @@ def main() -> None:
     # Determine whether we are in Profile Building mode or Profile Assignment mode:
     # "if it's the only collector used is profilecollector then it's building profiles, else it's used as a profile!"
     is_profile_building = bool(profile_target and args.collectors == ["ProfileCollector"])
-    norm_profile: str | None = None
+    norm_profile: str | list[str] | None = None
     multi_profile_active: bool = False
     available_target_profiles: list[str] = []
 
@@ -969,13 +1005,23 @@ def main() -> None:
         if is_profile_building:
             # Mode A: Profile Building Mode
             from resources.profile_urls import profile_directory
-            if profile_target != "all" and profile_target not in profile_directory:
-                parser.error(
-                    f"Unknown profile '{profile_target}' to build. Available profile categories: {list(profile_directory.keys())} or 'all'"
-                )
+            if profile_target == "all":
+                norm_profile = "all"
+            elif profile_target == "multi":
+                unknown = [p for p in requested_profiles if p not in profile_directory]
+                if unknown:
+                    parser.error(
+                        f"Unknown profile(s) {unknown} to build. Available profile categories: {list(profile_directory.keys())} or 'all'"
+                    )
+                norm_profile = requested_profiles
+            else:
+                if profile_target not in profile_directory:
+                    parser.error(
+                        f"Unknown profile '{profile_target}' to build. Available profile categories: {list(profile_directory.keys())} or 'all'"
+                    )
+                norm_profile = profile_target
             if profile_concurrency is not None:
                 args.crawlers = max(1, profile_concurrency)
-            norm_profile = profile_target
         else:
             # Mode B: Profile Assignment Mode (crawling with other data collectors)
             from Collectors.ProfileCollector import get_available_profiles, get_profile_user_dir, profile_exists
@@ -993,7 +1039,26 @@ def main() -> None:
                 print(
                     f"[INFO] Multi-profile crawling active for {len(available_target_profiles)} profile(s) "
                     f"({', '.join(available_target_profiles)}). "
-                    f"Profile concurrency = {args.crawlers} parallel crawl(s) (overrides -c; site-by-site synchronization barrier)."
+                    f"Profile concurrency = {args.crawlers} parallel crawl(s) (overrides -c; 10% chunk synchronization barrier)."
+                )
+            elif profile_target == "multi":
+                avail = get_available_profiles()
+                missing = [p for p in requested_profiles if not profile_exists(p)]
+                if missing:
+                    avail_str = f" Available built profiles: {', '.join(avail)}." if avail else " No built profiles found in profiles/."
+                    parser.error(
+                        f"Specified profile(s) {missing} do not exist in profiles/.{avail_str} "
+                        f"Please build them first using: python cli.py --profile <name>"
+                    )
+                available_target_profiles = requested_profiles
+                multi_profile_active = True
+                norm_profile = "all"
+                if profile_concurrency is not None:
+                    args.crawlers = max(1, profile_concurrency)
+                print(
+                    f"[INFO] Multi-profile crawling active for {len(available_target_profiles)} specific profile(s) "
+                    f"({', '.join(available_target_profiles)}). "
+                    f"Profile concurrency = {args.crawlers} parallel crawl(s) (overrides -c; 10% chunk synchronization barrier)."
                 )
             else:
                 if not profile_exists(profile_target):
@@ -1150,6 +1215,27 @@ def main() -> None:
             if recap_file.is_file():
                 print(f"[RECAP] Operation recap saved -> {recap_file.resolve()}")
             return
+        elif isinstance(norm_profile, list):
+            print(f"\n[PROFILE BUILD] Building {len(norm_profile)} profiles ({', '.join(norm_profile)}) concurrently (crawlers={active_crawlers}, max 5 open websites at the same time per browser)...")
+            async def _build_selected():
+                sem = asyncio.Semaphore(active_crawlers)
+                async def _b(p):
+                    async with sem:
+                        return await collector.build_profile(
+                            profile_name=p,
+                            timeout_per_site=active_timeout,
+                            settle_sec=1.0,
+                            headless=args.headless,
+                            parallel_crawls=1,
+                            max_open_pages=5,
+                            executable_path=executable_path,
+                            action_delay_min=args.min_delay,
+                            action_delay_max=args.max_delay,
+                        )
+                return await asyncio.gather(*[_b(p) for p in norm_profile])
+            asyncio.run(_build_selected())
+            print(f"\n[PROFILE BUILD] Successfully built profiles: {', '.join(norm_profile)}.")
+            return
         else:
             custom_urls = urls if (args.url or args.urls) else None
             url_count_desc = f"{len(custom_urls)} custom URLs" if custom_urls else "default profile URLs"
@@ -1194,7 +1280,7 @@ def main() -> None:
             production_mode=args.production_mode,
             depth=depth_config,
             fake_location=args.fake_location,
-            profile_name=norm_profile,
+            profile_name=norm_profile if isinstance(norm_profile, str) else None,
             profile_as_copy=bool(norm_profile and not is_profile_building),
             multi_profile_profiles=available_target_profiles if multi_profile_active else None,
             chunk_percent=args.chunk_percent,
