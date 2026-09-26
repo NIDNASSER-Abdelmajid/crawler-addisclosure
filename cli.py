@@ -1183,7 +1183,7 @@ def main() -> None:
 
     if args.profile:
         mode_label = "build" if is_profile_building else "assign"
-        prof_display = " ".join(profile_raw_tokens) if profile_raw_tokens else str(args.profile)
+        prof_display = " ".join(requested_profiles) if requested_profiles else str(args.profile)
         info.append(f"profile={prof_display} ({mode_label})")
     if args.use_safeguards:
         info.append("safeguards=ON")
