@@ -35,6 +35,7 @@ DEFAULT_TRACKED_PATHS: list[str] = [
     "resources/",
     "scripts/",
     "tests/",
+    "urls/"
 ]
 
 
