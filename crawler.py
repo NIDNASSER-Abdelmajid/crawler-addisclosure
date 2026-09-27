@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+import logging
 
 # Prevent Playwright from hanging on web fonts during screenshot captures
 os.environ["PW_TEST_SCREENSHOT_NO_FONTS_READY"] = "1"
