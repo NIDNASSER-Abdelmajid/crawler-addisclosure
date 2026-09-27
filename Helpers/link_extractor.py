@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import re
 from pathlib import Path
@@ -134,12 +135,12 @@ async def extract_internal_links(
         return []
 
     try:
-        raw_hrefs = await page.evaluate("""
+        raw_hrefs = await asyncio.wait_for(page.evaluate("""
             () => {
                 const anchors = Array.from(document.querySelectorAll('a[href]'));
                 return anchors.map(a => a.getAttribute('href') || a.href).filter(Boolean);
             }
-        """)
+        """), timeout=3.0)
     except Exception:
         raw_hrefs = []
 

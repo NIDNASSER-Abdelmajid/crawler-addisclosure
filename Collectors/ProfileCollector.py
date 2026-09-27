@@ -939,12 +939,12 @@ class ProfileCollector:
                 try:
                     for p in open_pages:
                         try:
-                            if not p.is_closed():
-                                await p.close()
+                            if not getattr(p, "is_closed", lambda: True)():
+                                await asyncio.wait_for(p.close(run_before_unload=False), timeout=2.0)
                         except Exception:
                             pass
                     open_pages.clear()
-                    await context.close()
+                    await asyncio.wait_for(context.close(), timeout=5.0)
                 except Exception as exc:
                     self._logger.debug(f"[ProfileCollector] Context close error: {exc}")
 

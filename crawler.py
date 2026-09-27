@@ -489,6 +489,43 @@ async def _extract_all_collector_data(
                     data[name] = inst.get_partial_results()
                 else:
                     data.setdefault(name, [])
+
+
+async def _safe_close_browser(
+    context: Any,
+    page: Page | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Immediately and safely close all pages and the browser context within a strict deadline."""
+    if context is None:
+        return
+    try:
+        pages = list(getattr(context, "pages", []))
+        for p in pages:
+            try:
+                if not getattr(p, "is_closed", lambda: True)():
+                    await asyncio.wait_for(p.close(run_before_unload=False), timeout=1.5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        await asyncio.wait_for(context.close(), timeout=4.0)
+        if logger:
+            logger.debug("Browser context closed successfully.")
+    except Exception as exc:
+        if logger:
+            logger.debug(f"Browser context close error: {exc}")
+
+    try:
+        browser = getattr(context, "browser", None)
+        if browser is not None and hasattr(browser, "close"):
+            await asyncio.wait_for(browser.close(), timeout=2.0)
+    except Exception:
+        pass
+
+
 def setup_playwright_exception_handler(loop: asyncio.AbstractEventLoop | None = None):
     """Filter out benign TargetClosedError noise from Playwright's unawaited background tasks."""
     if loop is None:
@@ -645,6 +682,10 @@ async def crawl(
     collectors_started = False
     collectors_completed = True
     had_timeout = False
+    browser_closed = False
+    context = None
+    page = None
+    _sg_cdp = None
     current_stage = "initialization"
     last_completed_stage = "initialization"
     timeout_stage = ""
@@ -713,6 +754,8 @@ async def crawl(
             await page.add_init_script(generate_fake_location_script(location_preset))
 
         start_time_crawl = time.time()
+        crawl_timeout = float(timeout) if timeout and timeout > 0 else 0.0
+        crawl_deadline = (start_time_crawl + crawl_timeout) if crawl_timeout > 0 else float("inf")
         try:
             current_stage = "pre_crawl"
             crawl_context.set_phase(Phase.PAGE_LOAD)
@@ -791,11 +834,13 @@ async def crawl(
 
             # --- 1. Page Load: Bounded navigation timeout (scales with timeout budget) ---
             current_stage = "navigation"
-            if timeout and timeout > 0:
-                if float(timeout) <= 30.0:
-                    page_timeout_sec = float(timeout)
+            if crawl_timeout > 0:
+                if crawl_timeout <= 30.0:
+                    page_timeout_sec = crawl_timeout
                 else:
-                    page_timeout_sec = min(float(timeout) * 0.5, 90.0)
+                    page_timeout_sec = min(crawl_timeout * 0.5, 90.0)
+                remaining_nav = max(1.0, crawl_deadline - time.time())
+                page_timeout_sec = min(page_timeout_sec, remaining_nav)
             else:
                 page_timeout_sec = PAGE_LOAD_TIMEOUT
             response = await _goto_with_fallback(page, url, page_timeout_sec, logger)
@@ -806,6 +851,12 @@ async def crawl(
             status_code = response.status if response else "?"
             logger.info(f"Loaded {page.url}  (HTTP {status_code})")
 
+            # Check if overall timeout budget was reached during navigation
+            if crawl_timeout > 0 and time.time() >= crawl_deadline:
+                logger.warning(f"Overall timeout budget ({crawl_timeout}s) reached after navigation.")
+                had_timeout = True
+                timeout_stage = "navigation_overall_timeout"
+
             # Store response status for safeguard engine post-processing
             if isinstance(status_code, int):
                 result["_response_status"] = status_code
@@ -815,13 +866,25 @@ async def crawl(
                         result["_retry_after_header"] = retry_after
 
             # --- 2. 5-second wait after loading for dynamic content and ads ---
-            current_stage = "post_load_wait"
-            logger.info(f"Waiting {POST_LOAD_WAIT_SECONDS}s for dynamic content, ads, and scripts to settle...")
-            await page.wait_for_timeout(int(POST_LOAD_WAIT_SECONDS * 1000))
-            last_completed_stage = "post_load_wait"
+            if not had_timeout:
+                current_stage = "post_load_wait"
+                wait_sec = POST_LOAD_WAIT_SECONDS
+                if crawl_timeout > 0:
+                    remaining_wait = crawl_deadline - time.time()
+                    if remaining_wait <= 0:
+                        had_timeout = True
+                        timeout_stage = "post_load_wait"
+                        wait_sec = 0.0
+                    else:
+                        wait_sec = min(wait_sec, remaining_wait)
+                if not had_timeout and wait_sec > 0:
+                    logger.info(f"Waiting {wait_sec:.1f}s for dynamic content, ads, and scripts to settle...")
+                    await page.wait_for_timeout(int(wait_sec * 1000))
+                    last_completed_stage = "post_load_wait"
 
             # --- 3. Post-navigation & Bot-block / CAPTCHA checks ---
-            current_stage = "post_navigation_checks"
+            if not had_timeout:
+                current_stage = "post_navigation_checks"
             if _safeguard_callbacks:
                 from safeguard_captcha import detect_captcha as _detect_captcha
                 captcha_result = await _detect_captcha(page)
@@ -842,12 +905,18 @@ async def crawl(
                 result["status"] = "failed"
                 result["_traffic_exceeded"] = True
             elif await _is_blocked(page):
-                logger.warning("Bot-block detected, retrying navigation once")
-                await page.wait_for_timeout(5000)
-                response = await _goto_with_fallback(page, url, page_timeout_sec, logger)
-                result["finalUrl"] = page.url
-                status_code = response.status if response else "?"
-                logger.info(f"Retry loaded {page.url}  (HTTP {status_code})")
+                if crawl_timeout > 0 and (crawl_deadline - time.time()) <= 6.0:
+                    logger.warning("Bot-block detected but timeout budget exhausted — skipping retry navigation")
+                    had_timeout = True
+                    timeout_stage = "bot_block_timeout"
+                else:
+                    logger.warning("Bot-block detected, retrying navigation once")
+                    await page.wait_for_timeout(5000)
+                    remaining_nav = max(1.0, crawl_deadline - time.time()) if crawl_timeout > 0 else page_timeout_sec
+                    response = await _goto_with_fallback(page, url, min(page_timeout_sec, remaining_nav), logger)
+                    result["finalUrl"] = page.url
+                    status_code = response.status if response else "?"
+                    logger.info(f"Retry loaded {page.url}  (HTTP {status_code})")
 
             last_completed_stage = "post_navigation_checks"
 
@@ -919,6 +988,19 @@ async def crawl(
                 ordered_collectors.append(ScreenshotCollector.COLLECTOR_NAME)
 
             for name in ordered_collectors:
+                if had_timeout:
+                    break
+                if crawl_timeout > 0:
+                    remaining_budget = crawl_deadline - time.time()
+                    if remaining_budget <= 0:
+                        logger.warning(
+                            f"Overall timeout budget ({crawl_timeout}s) reached before collector '{name}' — "
+                            "closing browser and finalizing."
+                        )
+                        had_timeout = True
+                        timeout_stage = f"{name}_overall_timeout"
+                        break
+
                 if _check_estop and _check_estop():
                     logger.warning("Emergency stop active — skipping remaining collectors")
                     had_timeout = True
@@ -932,6 +1014,9 @@ async def crawl(
 
                 current_stage = name.lower()
                 stage_timeout = STAGE_TIMEOUTS.get(name, DEFAULT_STAGE_TIMEOUT)
+                if crawl_timeout > 0:
+                    remaining_budget = crawl_deadline - time.time()
+                    stage_timeout = min(stage_timeout, max(1.0, remaining_budget))
 
                 try:
                     collector_result = await asyncio.wait_for(
@@ -946,8 +1031,8 @@ async def crawl(
                         had_timeout = True
                         timeout_stage = current_stage
                         logger.warning(
-                            f"[{name}] Collector reached stage timeout ({stage_timeout}s). "
-                            "Saving partial data and continuing to next step."
+                            f"[{name}] Collector reached stage timeout ({stage_timeout:.1f}s). "
+                            "Closing browser and finalizing partial crawl."
                         )
                     else:
                         failure_reason = f"{name} error: {col_exc}"
@@ -966,51 +1051,65 @@ async def crawl(
                         if hasattr(inst, "get_partial_results"):
                             result["data"][name] = inst.get_partial_results()
 
+                    # On timeout, break immediately so browser closes without running further collectors
+                    if is_to:
+                        break
+
             # --- 5. Disclosure Interaction Phase ---
             # Perform disclosure interaction only after passive measurements are frozen
-            crawl_context.set_phase(Phase.DISCLOSURE_INTERACTION)
-            if AdDisclosureCollector.COLLECTOR_NAME in collector_names or AdCollector.COLLECTOR_NAME in collector_names:
-                current_stage = AdDisclosureCollector.COLLECTOR_NAME.lower()
-                disc_inst = pre_crawl_instances.get(AdDisclosureCollector.COLLECTOR_NAME)
-                if disc_inst is None:
-                    disc_inst = AdDisclosureCollector()
-                    disc_inst.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
-                    pre_crawl_instances[AdDisclosureCollector.COLLECTOR_NAME] = disc_inst
-
-                ad_data = result["data"].get(AdCollector.COLLECTOR_NAME, {})
-                ad_attrs = ad_data.get("adAttrs", []) if isinstance(ad_data, dict) else []
-                stage_timeout = STAGE_TIMEOUTS.get(AdDisclosureCollector.COLLECTOR_NAME, DEFAULT_STAGE_TIMEOUT)
-
-                try:
-                    disc_result = await asyncio.wait_for(
-                        disc_inst.interact_and_collect_disclosures(page, ad_attrs),
-                        timeout=stage_timeout,
+            if not had_timeout and (AdDisclosureCollector.COLLECTOR_NAME in collector_names or AdCollector.COLLECTOR_NAME in collector_names):
+                if crawl_timeout > 0 and (crawl_deadline - time.time()) <= 0:
+                    logger.warning(
+                        f"Overall timeout budget ({crawl_timeout}s) reached before disclosure interaction — skipping."
                     )
-                    result["data"][AdDisclosureCollector.COLLECTOR_NAME] = disc_result
-                    last_completed_stage = current_stage
-                    if AdCollector.COLLECTOR_NAME in collector_names:
-                        ad_inst = pre_crawl_instances.get(AdCollector.COLLECTOR_NAME)
-                        if ad_inst and hasattr(ad_inst, "_scrape_results"):
-                            matched = sum(1 for a in ad_attrs if a.get("adDisclosureText") or a.get("adDisclosurePageUrl"))
-                            ad_inst._scrape_results["nAdDisclosureMatched"] = matched
-                            ad_inst._scrape_results["nAdDisclosureUnmatched"] = max(0, len(ad_attrs) - matched)
-                            ad_inst._scrape_results["nClickedAdChoices"] = sum(1 for a in disc_inst._attempts if a.get("interaction_attempted"))
-                except Exception as disc_exc:
-                    collectors_completed = False
-                    is_to = isinstance(disc_exc, asyncio.TimeoutError) or _is_timeout_error(disc_exc)
-                    if is_to:
-                        had_timeout = True
-                        timeout_stage = current_stage
-                        logger.warning(
-                            f"[AdDisclosureCollector] Collector reached stage timeout ({stage_timeout}s). "
-                            "Saving partial data."
-                        )
-                    else:
-                        failure_reason = f"AdDisclosureCollector error: {disc_exc}"
-                        logger.error(f"[AdDisclosureCollector] Collector error: {disc_exc}")
+                    had_timeout = True
+                    timeout_stage = "disclosure_overall_timeout"
+                else:
+                    crawl_context.set_phase(Phase.DISCLOSURE_INTERACTION)
+                    current_stage = AdDisclosureCollector.COLLECTOR_NAME.lower()
+                    disc_inst = pre_crawl_instances.get(AdDisclosureCollector.COLLECTOR_NAME)
+                    if disc_inst is None:
+                        disc_inst = AdDisclosureCollector()
+                        disc_inst.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
+                        pre_crawl_instances[AdDisclosureCollector.COLLECTOR_NAME] = disc_inst
 
-                    if hasattr(disc_inst, "get_partial_results"):
-                        result["data"][AdDisclosureCollector.COLLECTOR_NAME] = disc_inst.get_partial_results()
+                    ad_data = result["data"].get(AdCollector.COLLECTOR_NAME, {})
+                    ad_attrs = ad_data.get("adAttrs", []) if isinstance(ad_data, dict) else []
+                    stage_timeout = STAGE_TIMEOUTS.get(AdDisclosureCollector.COLLECTOR_NAME, DEFAULT_STAGE_TIMEOUT)
+                    if crawl_timeout > 0:
+                        remaining_budget = crawl_deadline - time.time()
+                        stage_timeout = min(stage_timeout, max(1.0, remaining_budget))
+
+                    try:
+                        disc_result = await asyncio.wait_for(
+                            disc_inst.interact_and_collect_disclosures(page, ad_attrs),
+                            timeout=stage_timeout,
+                        )
+                        result["data"][AdDisclosureCollector.COLLECTOR_NAME] = disc_result
+                        last_completed_stage = current_stage
+                        if AdCollector.COLLECTOR_NAME in collector_names:
+                            ad_inst = pre_crawl_instances.get(AdCollector.COLLECTOR_NAME)
+                            if ad_inst and hasattr(ad_inst, "_scrape_results"):
+                                matched = sum(1 for a in ad_attrs if a.get("adDisclosureText") or a.get("adDisclosurePageUrl"))
+                                ad_inst._scrape_results["nAdDisclosureMatched"] = matched
+                                ad_inst._scrape_results["nAdDisclosureUnmatched"] = max(0, len(ad_attrs) - matched)
+                                ad_inst._scrape_results["nClickedAdChoices"] = sum(1 for a in disc_inst._attempts if a.get("interaction_attempted"))
+                    except Exception as disc_exc:
+                        collectors_completed = False
+                        is_to = isinstance(disc_exc, asyncio.TimeoutError) or _is_timeout_error(disc_exc)
+                        if is_to:
+                            had_timeout = True
+                            timeout_stage = current_stage
+                            logger.warning(
+                                f"[AdDisclosureCollector] Collector reached stage timeout ({stage_timeout:.1f}s). "
+                                "Saving partial data."
+                            )
+                        else:
+                            failure_reason = f"AdDisclosureCollector error: {disc_exc}"
+                            logger.error(f"[AdDisclosureCollector] Collector error: {disc_exc}")
+
+                        if hasattr(disc_inst, "get_partial_results"):
+                            result["data"][AdDisclosureCollector.COLLECTOR_NAME] = disc_inst.get_partial_results()
 
             # Determine success status and retry policy
             ad_data = result["data"].get(AdCollector.COLLECTOR_NAME, {})
@@ -1038,13 +1137,14 @@ async def crawl(
             elif ad_collector_ran or has_ads:
                 result["ad_timeout_no_retry"] = True
 
-        except Exception as exc:
-            crawler_exc = exc
-            if _is_timeout_error(exc) and (crawl_started or page_loaded or collectors_started):
+        except (Exception, asyncio.CancelledError) as exc:
+            crawler_exc = exc if isinstance(exc, Exception) else None
+            is_to = _is_timeout_error(exc) if isinstance(exc, Exception) else True
+            if is_to and (crawl_started or page_loaded or collectors_started):
                 result["successful"] = False
                 result["status"] = "timed_out"
                 had_timeout = True
-                timeout_stage = current_stage
+                timeout_stage = current_stage or "timeout"
             else:
                 result["successful"] = False
                 result["status"] = "failed"
@@ -1052,32 +1152,58 @@ async def crawl(
             logger.error(f"Crawl error at stage '{current_stage}': {exc}")
 
         finally:
-            if page_loaded:
-
-                try:
-                    await _write_html_snapshot(page, site_dir, logger)
-                    last_completed_stage = "html_snapshot"
-                except Exception as exc:
-                    logger.debug(f"HTML snapshot write error: {exc}")
-
-                if extract_links:
+            # Detach safeguard CDP session if created
+            if _safeguard_callbacks and _safeguard_callbacks.get("traffic_monitor"):
+                if '_sg_cdp' in locals() and _sg_cdp is not None:
                     try:
-                        result["discovered_links"] = await extract_internal_links(
-                            page=page,
-                            root_url=root_seed_url or url,
-                            parent_url=parent_url,
-                            max_links=max_links_per_page,
-                            exclude_urls=set(exclude_links or []),
-                            output_dir=output_dir,
-                        )
-                        logger.info(f"Extracted {len(result['discovered_links'])} internal link(s) for depth crawl")
-                    except Exception as link_exc:
-                        logger.debug(f"Link extraction error: {link_exc}")
+                        await asyncio.wait_for(_sg_cdp.detach(), timeout=1.0)
+                    except Exception:
+                        pass
+
+            # CRITICAL: If timeout occurred, immediately close browser
+            if had_timeout:
+                logger.info(f"Crawl timed out (stage: '{timeout_stage}'). Closing browser immediately.")
+                if context is not None and CookieCollector.COLLECTOR_NAME in collector_names:
+                    if CookieCollector.COLLECTOR_NAME not in result.get("data", {}) or not result["data"][CookieCollector.COLLECTOR_NAME]:
+                        try:
+                            raw_cookies = await asyncio.wait_for(context.cookies(), timeout=1.0)
+                            cookie_col = CookieCollector()
+                            cookie_col.init(str(site_dir), logger, url_hash, crawl_context=crawl_context)
+                            result.setdefault("data", {})[CookieCollector.COLLECTOR_NAME] = [
+                                cookie_col._process_cookie(c) for c in raw_cookies
+                            ]
+                        except Exception:
+                            pass
+                await asyncio.shield(_safe_close_browser(context, page, logger))
+                browser_closed = True
+                result["discovered_links"] = []
+            else:
+                # Normal completion: capture HTML snapshot & internal links while page is still open
+                if page_loaded:
+                    try:
+                        await _write_html_snapshot(page, site_dir, logger)
+                        last_completed_stage = "html_snapshot"
+                    except Exception as exc:
+                        logger.debug(f"HTML snapshot write error: {exc}")
+
+                    if extract_links:
+                        try:
+                            result["discovered_links"] = await extract_internal_links(
+                                page=page,
+                                root_url=root_seed_url or url,
+                                parent_url=parent_url,
+                                max_links=max_links_per_page,
+                                exclude_urls=set(exclude_links or []),
+                                output_dir=output_dir,
+                            )
+                            logger.info(f"Extracted {len(result['discovered_links'])} internal link(s) for depth crawl")
+                        except Exception as link_exc:
+                            logger.debug(f"Link extraction error: {link_exc}")
+                            result["discovered_links"] = []
+                    else:
                         result["discovered_links"] = []
                 else:
                     result["discovered_links"] = []
-            else:
-                result["discovered_links"] = []
 
             # Guaranteed extraction of all collector data (never leave data field empty on timeout/error)
             try:
@@ -1086,8 +1212,8 @@ async def crawl(
                     collector_names=collector_names,
                     pre_crawl_instances=pre_crawl_instances,
                     ad_collector_instance=ad_collector_instance,
-                    page=page,
-                    context=context if 'context' in locals() else None,
+                    page=page if not browser_closed else None,
+                    context=context if not browser_closed else None,
                     site_dir=site_dir,
                     final_url=result.get("finalUrl", url),
                     logger=logger,
@@ -1097,14 +1223,12 @@ async def crawl(
             except Exception as extract_exc:
                 logger.error(f"Error extracting collector data: {extract_exc}")
 
-            result["testFinished"] = int(time.time())
+            # Guaranteed closure of browser context before post-processing/saving
+            if not browser_closed:
+                await asyncio.shield(_safe_close_browser(context, page, logger))
+                browser_closed = True
 
-            # Detach safeguard CDP session if created
-            if _safeguard_callbacks and _safeguard_callbacks.get("traffic_monitor"):
-                try:
-                    await _sg_cdp.detach()
-                except Exception:
-                    pass
+            result["testFinished"] = int(time.time())
 
             # Calculate reconciled counts
             ad_data = result["data"].get(AdCollector.COLLECTOR_NAME, {})
@@ -1322,10 +1446,12 @@ async def crawl(
                     pass
 
 
-            try:
-                await context.close()
-            except Exception as exc:
-                logger.debug(f"Context close error: {exc}")
+            if not browser_closed:
+                try:
+                    await asyncio.shield(_safe_close_browser(context, page, logger))
+                    browser_closed = True
+                except Exception as exc:
+                    logger.debug(f"Context close error: {exc}")
 
             # Windows file-lock release retry loop:
             # Clean up ephemeral attempt profile or temporary profile copy,

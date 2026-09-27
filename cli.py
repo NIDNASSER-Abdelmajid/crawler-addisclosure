@@ -279,9 +279,30 @@ async def _run_all(
                 "profile_as_copy": effective_profile_as_copy,
             },
         }
-        if use_safeguards and engine is not None:
-            return await engine.execute_visit_with_retries(url, crawl, crawl_kwargs)
-        return await crawl(url, **crawl_kwargs)
+        outer_budget = (float(timeout) + 15.0) if timeout and timeout > 0 else None
+        try:
+            if use_safeguards and engine is not None:
+                if outer_budget:
+                    return await asyncio.wait_for(
+                        engine.execute_visit_with_retries(url, crawl, crawl_kwargs),
+                        timeout=outer_budget,
+                    )
+                return await engine.execute_visit_with_retries(url, crawl, crawl_kwargs)
+            if outer_budget:
+                return await asyncio.wait_for(
+                    crawl(url, **crawl_kwargs),
+                    timeout=outer_budget,
+                )
+            return await crawl(url, **crawl_kwargs)
+        except asyncio.TimeoutError:
+            print(f"[TIMEOUT] {url} exceeded outer deadline ({outer_budget}s). Browser closed and continuing.")
+            return {
+                "url": url,
+                "successful": False,
+                "status": "timed_out",
+                "failure_reason": f"Outer crawl deadline ({outer_budget}s) exceeded",
+                "data": {},
+            }
 
     def _result_tag(result: dict) -> str:
         success = result.get("successful")

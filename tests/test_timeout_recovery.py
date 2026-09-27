@@ -836,3 +836,46 @@ async def test_pre_ad_timeout_triggers_retry(temp_output_dir):
     assert attempts == [1, 2]
     assert result.get("successful") == "true"
 
+
+@pytest.mark.asyncio
+async def test_safe_close_browser_closes_pages_and_context():
+    """_safe_close_browser must close all open pages and the context within timeout."""
+    from crawler import _safe_close_browser
+
+    p1 = MagicMock()
+    p1.is_closed = MagicMock(return_value=False)
+    p1.close = AsyncMock()
+
+    p2 = MagicMock()
+    p2.is_closed = MagicMock(return_value=False)
+    p2.close = AsyncMock()
+
+    context = MagicMock()
+    context.pages = [p1, p2]
+    context.close = AsyncMock()
+
+    await _safe_close_browser(context)
+
+    p1.close.assert_awaited_once_with(run_before_unload=False)
+    p2.close.assert_awaited_once_with(run_before_unload=False)
+    context.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_safe_close_browser_error_resilience():
+    """_safe_close_browser must not raise even if context.close fails."""
+    from crawler import _safe_close_browser
+
+    p1 = MagicMock()
+    p1.is_closed = MagicMock(return_value=False)
+    p1.close = AsyncMock(side_effect=Exception("page close error"))
+
+    context = MagicMock()
+    context.pages = [p1]
+    context.close = AsyncMock(side_effect=Exception("CDP connection closed"))
+
+    # Must complete cleanly without unhandled exceptions
+    await _safe_close_browser(context)
+    context.close.assert_awaited_once()
+
+
