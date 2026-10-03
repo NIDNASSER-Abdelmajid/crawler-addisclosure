@@ -1765,7 +1765,7 @@ class AdCollector:
 
     async def _resolve_browser_frame_info(self, frame_or_handle: Frame | ElementHandle | None, page_url: str) -> dict[str, Any]:
         if frame_or_handle is None:
-            return {
+            return { 
                 "frameId": None,
                 "loaderId": None,
                 "executionContextId": None,
